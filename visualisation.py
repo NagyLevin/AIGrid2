@@ -277,8 +277,10 @@ class Screen:
             turn = str(state.turn)
         self.print_info(turn, last_step)
 
+#autolplay before
 def app(history: replay.Replay, cell_size: int,
-        visibility_radius: Optional[int]):
+        visibility_radius: Optional[int], autoplay_delay: Optional[float]):
+#autolplay after
     pygame.init()
     pygame.display.set_caption('Grid race')
     screen = Screen(
@@ -293,6 +295,14 @@ def app(history: replay.Replay, cell_size: int,
     repeat = 0
     last_step = None
     max_turns = max(history.states, key=lambda s: s.turn).turn
+
+    #autolplay before
+    # Initialize autoplay state: start active if delay is provided
+    autoplay_active = autoplay_delay is not None
+    # Use this to track when the last step occurred for time-based delay
+    last_step_time = pygame.time.get_ticks() 
+    #autolplay after
+
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -300,17 +310,33 @@ def app(history: replay.Replay, cell_size: int,
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_RIGHT:
                     playdir = 1
+                    #autolplay before
+                    autoplay_active = False # Disable autoplay on manual move
+                    #autolplay after
                 elif event.key == pygame.K_LEFT:
                     playdir = -1
+                    #autolplay before
+                    autoplay_active = False # Disable autoplay on manual move
+                    #autolplay after
                 elif event.key == pygame.K_f:
                     if visibility_radius is not None:
                         screen.should_draw_fog = not screen.should_draw_fog
                     else:
                         print('Error: need to supply the visibility '
                               'radius parameter to draw fog.')
+                #autolplay before
+                elif event.key == pygame.K_SPACE:
+                    # Spacebar always toggles autoplay
+                    autoplay_active = not autoplay_active
+                    if autoplay_active:
+                        # Reset the timer when starting/resuming autoplay
+                        last_step_time = pygame.time.get_ticks()
+                #autolplay after
             elif event.type == pygame.KEYUP:
                 playdir = 0
                 repeat = 0
+        
+        # Manual movement logic (still frame-based repeat)
         if playdir != 0:
             repeat += 1
         if playdir == 1 and (repeat == 1
@@ -318,6 +344,21 @@ def app(history: replay.Replay, cell_size: int,
             t += 1
         if playdir == -1 and (repeat == 1 or repeat > 10) and t > 0:
             t -= 1
+
+        #autolplay before
+        # Autoplay step logic
+        if autoplay_active:
+            # Determine the delay in milliseconds. Default to 250ms (4 steps/sec) if toggled by spacebar
+            delay_ms = int(autoplay_delay * 1000) if autoplay_delay is not None else 250 
+            current_time = pygame.time.get_ticks()
+            if current_time - last_step_time >= delay_ms:
+                last_step_time = current_time
+                if t < len(history.states) - 1:
+                    t += 1
+                else:
+                    autoplay_active = False # Stop at the end
+        #autolplay after
+        
         if t > 0:
             last_step = history.steps[t - 1]
             last_state = history.states[t - 1]
@@ -350,6 +391,14 @@ def parse_args() -> argparse.Namespace:
         help='Size (in pixels) of the cells in the visualisation.')
     parser.add_argument(
         '--visibility_radius', type=int, help='Visibility radius (optional).')
+    #autolplay before
+    parser.add_argument(
+        '--autoplay',
+        type=float,
+        default=None,
+        help='Autoplay delay in seconds (optional). If provided, starts '
+        'autoplay automatically with this delay.')
+    #autolplay after
     return parser.parse_args()
 
 def main():
@@ -357,7 +406,9 @@ def main():
     history = replay.deserialise(args.replay_file, allow_extra_keys=True)
     assert history.version >= 1, (
         f'Replay file version ({history.version}) is too old.')
-    app(history, args.cell_size, args.visibility_radius)
+    #autolplay before
+    app(history, args.cell_size, args.visibility_radius, args.autoplay)
+    #autolplay after
 
 if __name__ == "__main__":
     main()
