@@ -10,6 +10,9 @@ import sys
 import network
 
 LOGGING = True
+#advanced loggings
+LOG_DIR = os.path.join(os.getcwd(), "logs")
+#advanced loggings
 
 class Logger:
 
@@ -46,10 +49,12 @@ class SubmissionManager():
 
     def __init__(self, judge_address: str, exe_cmd: list[str]) -> None:
         if LOGGING:
-            self.logger = Logger(
-                'communication.'
-                f'{datetime.datetime.now().strftime("%Y%m%d_%H%M%S.%f")[:-3]}'
-                '.log')
+            #advanced loggings
+            os.makedirs(LOG_DIR, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S.%f")[:-3]
+            log_path = os.path.join(LOG_DIR, f"communication.{ts}.log")
+            self.logger = Logger(log_path)
+            #advanced loggings
         else:
             self.logger = None
         # Start submitted program
