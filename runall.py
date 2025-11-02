@@ -22,7 +22,7 @@ os.makedirs(os.path.join(BASE_DIR, "output"), exist_ok=True)
 BOTS: List[Tuple[str, str]] = [
     
     ("BOT1", "lieutenant_crown_him_with_many_crowns_thy_full_gallant_legions_he_found_it_in_him_to_forgive.py"),
-    #("BOT2", "naive_astar_no_speed.py"),
+    ("BOT2", "levin.py"),
     #("BOT3", "astarrework.py"),
     #("BOT4", "levin.py"),
     # Példa: ("SAJAT_BOT", "my_cool_bot.py"),
@@ -31,7 +31,7 @@ BOTS: List[Tuple[str, str]] = [
 
 # Judge parancs # figyelj arra hogy át kell állítani a playerek számát
 judge_cmd = [
-    PY, "judge/run.py", "judge/sample_config.json", "1",
+    PY, "judge/run.py", "judge/sample_config.json", "2",
     "--replay_file", "output/replay.json",
     "--output_file", "output/output.json",
     "--connection_timeout", "60",
