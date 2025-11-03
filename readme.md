@@ -22,3 +22,7 @@ JUDGE: 2 4 → az egyik játékos pozíciója: (2,4).
 JUDGE: 3 3 → egy másik játékos pozíciója: (3,3).
 
 Elvileg ezek globális poziciók
+
+
+idea 1
+https://stackoverflow.com/questions/34001535/path-finding-with-limited-vision
