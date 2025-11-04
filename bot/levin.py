@@ -6,54 +6,63 @@ from collections import deque
 import numpy as np
 from typing import Optional, NamedTuple, Tuple, List
 
-# --- Logging setup -------------------------------------------------------------
+# ----------------------------- Loggolás (egyszerű) ----------------------------
 
 LOG_FILE = "levin.log"
 
-def log_line(prefix: str, message: str) -> None:
-    """Append one line: '<prefix>: <message>' to LOG_FILE (never crash on error)."""
+def writeLog(prefix: str, message: str) -> None:
+    """
+    Egyszerű log: fájlba ír egy sort.
+
+    @param prefix: log prefix (pl. 'JUDGE' / 'Agent' / 'INFO')
+    @param message: maga az üzenet
+    """
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"{prefix}: {message}\n")
             f.flush()
     except Exception as e:
+        # Igen tudom, ez túl egyszerű, de hibánál is inkább lássuk mi történt
         print(f"[logging error] {e}", file=sys.stderr)
 
-def log_judge(raw: str) -> None:
-    log_line("JUDGE", raw)
+def logJudge(raw: str) -> None:
+    writeLog("JUDGE", raw)
 
-def log_agent(raw: str) -> None:
-    log_line("Agent", raw)
+def logAgent(raw: str) -> None:
+    writeLog("Agent", raw)
 
-def log_info(msg: str) -> None:
-    log_line("INFO", msg)
+def logInfo(msg: str) -> None:
+    writeLog("INFO", msg)
 
-def send_agent_move(ax: int, ay: int) -> None:
-    """Send acceleration to judge + log it."""
+def sendAgentMove(ax: int, ay: int) -> None:
+    """
+    Elküldi az aktuális lépést a judge felé (stdout).
+
+    @param ax: gyorsulás x
+    @param ay: gyorsulás y
+    """
     out = f"{ax} {ay}"
     print(out)
-    log_agent(out)
+    logAgent(out)
 
-# --- Environment types (mirror server) ----------------------------------------
+# ------------------------- Alap típusok (környezettől) ------------------------
 
 class CellType(enum.Enum):
     GOAL = 100
     START = 1
     WALL = -1
-    UNKNOWN = 2        # fontos: a saját világmodellben ez NEM bejárható
+    UNKNOWN = 2         # saját világmodellben: még nem láttuk → tiltott a tervezésben
     EMPTY = 0
-    NOT_VISIBLE = 3    # szerver-ablak csak; saját térképre nem mentjük el így
+    NOT_VISIBLE = 3     # csak az aktuális ablakban; a világmodellbe nem így kerül
 
 class Player(NamedTuple):
     x: int
     y: int
     vel_x: int
     vel_y: int
-
     @property
     def pos(self) -> np.ndarray:
         return np.array([self.x, self.y], dtype=int)
-
     @property
     def vel(self) -> np.ndarray:
         return np.array([self.vel_x, self.vel_y], dtype=int)
@@ -65,185 +74,170 @@ class Circuit(NamedTuple):
 
 class State(NamedTuple):
     circuit: Circuit
-    visible_track: Optional[np.ndarray]   # safety map (NOT_VISIBLE->WALL)
-    visible_raw: Optional[np.ndarray]     # raw (ahol nem láttunk: NOT_VISIBLE)
+    visible_track: Optional[np.ndarray]   # safety-map (NOT_VISIBLE->WALL)
+    visible_raw: Optional[np.ndarray]     # raw ablak (NOT_VISIBLE megtartva)
     players: List[Player]
     agent: Optional[Player]
 
-# --- IO with the judge ---------------------------------------------------------
+# ----------------------------- Bemenet olvasás --------------------------------
 
-def read_initial_observation() -> Circuit:
+def readInitialObservation() -> Circuit:
     """
-    Reads: H W num_players visibility_radius
+    Beolvassa az első sort a judge-tól.
+
+    @return Circuit (pályaméret, játékosok száma, látótáv)
     """
     raw = input()
-    log_judge(raw)
-    H, W, num_players, visibility_radius = map(int, raw.split())
-    return Circuit((H, W), num_players, visibility_radius)
+    logJudge(raw)
+    H, W, numPlayers, visibilityRadius = map(int, raw.split())
+    return Circuit((H, W), numPlayers, visibilityRadius)
 
-def read_observation(old_state: State) -> Optional[State]:
+def readObservation(oldState: State) -> Optional[State]:
     """
-    Reads one turn:
-      <posx posy velx vely> or '~~~END~~~'
-      <num_players lines: pposx pposy>
-      <(2R+1) lines of the local window values>
-    Builds:
-      visible_raw  : full-map array (NOT_VISIBLE where unknown this turn)
-      visible_track: full-map safety array (NOT_VISIBLE treated as WALL)
+    Egy kör megfigyeléseinek beolvasása.
+
+    @param oldState: előző állapot (csak a circuit kell belőle)
+    @return új State vagy None, ha '~~~END~~~'
     """
     line = input()
-    log_judge(line)
+    logJudge(line)
     if line == '~~~END~~~':
         return None
 
     posx, posy, velx, vely = map(int, line.split())
     agent = Player(posx, posy, velx, vely)
-    circuit_data = old_state.circuit
+    circuit = oldState.circuit
 
-    # Other players (positions only per spec here)
     players: List[Player] = []
-    for _ in range(circuit_data.num_players):
+    for _ in range(circuit.num_players):
         pline = input()
-        log_judge(pline)
+        logJudge(pline)
         pposx, pposy = map(int, pline.split())
         players.append(Player(pposx, pposy, 0, 0))
 
-    H, W = circuit_data.track_shape
-    R = circuit_data.visibility_radius
+    H, W = circuit.track_shape
+    R = circuit.visibility_radius
 
-    # Prepare full-size buffers
-    visible_raw = np.full((H, W), CellType.NOT_VISIBLE.value, dtype=int)
-    visible_track = np.full((H, W), CellType.WALL.value, dtype=int)  # safety: unseen=WALL
+    visibleRaw = np.full((H, W), CellType.NOT_VISIBLE.value, dtype=int)
+    visibleTrack = np.full((H, W), CellType.WALL.value, dtype=int)  # unseen=WALL
 
-    # Read exactly (2R+1) lines; place them into the correct strip of the map
     for i in range(2 * R + 1):
-        row_raw = input()
-        log_judge(row_raw)
-        line_vals = [int(a) for a in row_raw.split()]
+        rowRaw = input()
+        logJudge(rowRaw)
+        lineVals = [int(a) for a in rowRaw.split()]
 
         x = posx - R + i
         if x < 0 or x >= H:
             continue
-        y_start = posy - R
-        y_end = y_start + (2 * R + 1)
+        yStart = posy - R
+        yEnd = yStart + (2 * R + 1)
 
-        # Trim horizontally to [0, W)
-        slice_vals = line_vals[:]
-        y0 = y_start
-        if y_start < 0:
-            slice_vals = slice_vals[-y_start:]
+        sliceVals = lineVals[:]
+        y0 = yStart
+        if yStart < 0:
+            sliceVals = sliceVals[-yStart:]
             y0 = 0
-        if y_end > W:
-            slice_vals = slice_vals[:-(y_end - W)]
-        y1 = y0 + len(slice_vals)
+        if yEnd > W:
+            sliceVals = sliceVals[:-(yEnd - W)]
+        y1 = y0 + len(sliceVals)
         if y0 < y1:
-            # raw: keep NOT_VISIBLE as is
-            visible_raw[x, y0:y1] = slice_vals
-            # safety: NOT_VISIBLE -> WALL
-            row_safety = [CellType.WALL.value if v == CellType.NOT_VISIBLE.value else v
-                          for v in slice_vals]
-            visible_track[x, y0:y1] = row_safety
+            visibleRaw[x, y0:y1] = sliceVals
+            # safety map: NOT_VISIBLE -> WALL
+            rowSafety = [CellType.WALL.value if v == CellType.NOT_VISIBLE.value else v
+                         for v in sliceVals]
+            visibleTrack[x, y0:y1] = rowSafety
 
-    return old_state._replace(
-        visible_track=visible_track, visible_raw=visible_raw,
+    return oldState._replace(
+        visible_track=visibleTrack, visible_raw=visibleRaw,
         players=players, agent=agent
     )
 
-# --- World model (persistent across turns) ------------------------------------
+# ----------------------------- Világmodell ------------------------------------
 
 class WorldModel:
     """
-    Persistent map & stats:
-      known_map[x,y]: what we (ever) saw there (UNKNOWN initially).
-                      We treat UNKNOWN as non-traversable for planning.
-      visited_count[x,y]: how many times we stood on (x,y)
+    Tartós térkép:
+      known_map[x,y]: amit valaha láttunk (UNKNOWN kezdetben).
+      visited_count[x,y]: hányszor álltunk a cellában.
+
+    UNKNOWN-t nem tekintjük bejárhatónak a tervezésnél (óvatos üzem).
     """
-    def __init__(self, shape: tuple[int,int]) -> None:
+
+    def __init__(self, shape: tuple[int, int]) -> None:
         H, W = shape
         self.shape = shape
         self.known_map = np.full((H, W), CellType.UNKNOWN.value, dtype=int)
         self.visited_count = np.zeros((H, W), dtype=int)
 
-    def update_with_observation(self, st: State) -> None:
-        """Integrate the raw window: everything != NOT_VISIBLE becomes known."""
+    def updateWithObservation(self, st: State) -> None:
+        """
+        @param st: State (a raw ablakot használjuk fel)
+        """
         assert st.visible_raw is not None
         raw = st.visible_raw
-        seen_mask = (raw != CellType.NOT_VISIBLE.value)
-        self.known_map[seen_mask] = raw[seen_mask]
+        seen = (raw != CellType.NOT_VISIBLE.value)
+        self.known_map[seen] = raw[seen]
 
-    # ---- Frontier detection ---------------------------------------------------
-
-    def _is_traversable_known(self, v: int) -> bool:
-        # UNKNOWN (2) is considered NOT traversable for planning safety.
+    # ---- Frontier keresés ----
+    def _trav(self, v: int) -> bool:
         return (v >= 0) and (v != CellType.UNKNOWN.value)
 
-    def _neighbors4(self, x: int, y: int):
+    def _n4(self, x: int, y: int):
         for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
             nx, ny = x+dx, y+dy
             if 0 <= nx < self.shape[0] and 0 <= ny < self.shape[1]:
                 yield nx, ny
 
-    def frontier_cells(self) -> List[Tuple[int,int]]:
-        """Cells that are known-free and adjacent to UNKNOWN."""
+    def frontierCells(self) -> List[Tuple[int,int]]:
         km = self.known_map
         H, W = self.shape
         out = []
         for x in range(H):
             for y in range(W):
-                if not self._is_traversable_known(km[x,y]):
+                if not self._trav(km[x,y]):
                     continue
-                for nx, ny in self._neighbors4(x,y):
+                for nx, ny in self._n4(x,y):
                     if km[nx,ny] == CellType.UNKNOWN.value:
-                        out.append((x,y))
-                        break
+                        out.append((x,y)); break
         return out
 
-    def nearest_frontier_from(self, start: Tuple[int,int]) -> Optional[List[Tuple[int,int]]]:
-        """
-        BFS in (x,y) space over known-traversable cells, to get the shortest
-        cell-path to the closest frontier cell. Returns the cell-path (including start and target).
-        """
+    def nearestFrontierFrom(self, start: Tuple[int,int]) -> Optional[List[Tuple[int,int]]]:
         sx, sy = start
-        if not (0 <= sx < self.shape[0] and 0 <= sy < self.shape[1]):
-            return None
-        if not self._is_traversable_known(self.known_map[sx,sy]):
-            return None
+        if not (0 <= sx < self.shape[0] and 0 <= sy < self.shape[1]): return None
+        if not self._trav(self.known_map[sx,sy]): return None
 
-        goals = set(self.frontier_cells())
-        if not goals:
-            return None
+        goals = set(self.frontierCells())
+        if not goals: return None
 
         q = deque([(sx,sy)])
-        prev = { (sx,sy): None }
+        prev = {(sx,sy): None}
         while q:
-            x, y = q.popleft()
+            x,y = q.popleft()
             if (x,y) in goals:
-                # reconstruct
                 path = []
                 cur = (x,y)
                 while cur is not None:
-                    path.append(cur)
-                    cur = prev[cur]
-                path.reverse()
-                return path
-            for nx, ny in self._neighbors4(x,y):
-                if (nx,ny) in prev:
-                    continue
-                if self._is_traversable_known(self.known_map[nx,ny]):
-                    prev[(nx,ny)] = (x,y)
-                    q.append((nx,ny))
+                    path.append(cur); cur = prev[cur]
+                path.reverse(); return path
+            for nx,ny in self._n4(x,y):
+                if (nx,ny) in prev: continue
+                if self._trav(self.known_map[nx,ny]):
+                    prev[(nx,ny)] = (x,y); q.append((nx,ny))
         return None
 
-# --- Geometry / collision ------------------------------------------------------
+# ------------------------- Geometria / ütközés --------------------------------
 
-def is_traversable_for_planning(v: int) -> bool:
-    """Traversal rule on the PERSISTENT map."""
+def isTraversableForPlanning(v: int) -> bool:
     return (v >= 0) and (v != CellType.UNKNOWN.value)
 
-def valid_line_on_map(world: WorldModel, p1: np.ndarray, p2: np.ndarray) -> bool:
+def validLineOnMap(world: WorldModel, p1: np.ndarray, p2: np.ndarray) -> bool:
     """
-    Conservative 'line of motion' check between two integer points p1 -> p2
-    using the persistent known_map. UNKNOWN treated as blocking.
+    Egyszerű, mégis szigorú vonal-ellenőrzés a tartós (known_map) térképen.
+
+    @param world: WorldModel
+    @param p1: kezdő poz
+    @param p2: cél poz
+    @return True ha a teljes szakasz (óvatos mód) bejárható
     """
     km = world.known_map
     H, W = km.shape
@@ -252,312 +246,330 @@ def valid_line_on_map(world: WorldModel, p1: np.ndarray, p2: np.ndarray) -> bool
         return False
 
     diff = p2 - p1
-    # vertical-ish sampling (as in the baseline code)
     if diff[0] != 0:
         slope = diff[1] / diff[0]
-        d = int(np.sign(diff[0]))  # step in x
+        d = int(np.sign(diff[0]))
         for i in range(abs(diff[0]) + 1):
             x = int(p1[0] + i*d)
             y = p1[1] + i*slope*d
-            y_ceil = int(np.ceil(y))
-            y_floor = int(np.floor(y))
-            if not is_traversable_for_planning(km[x, y_ceil]) and \
-               not is_traversable_for_planning(km[x, y_floor]):
+            yCeil = int(np.ceil(y)); yFloor = int(np.floor(y))
+            if not isTraversableForPlanning(km[x, yCeil]) and \
+               not isTraversableForPlanning(km[x, yFloor]):
                 return False
-    # horizontal-ish sampling
     if diff[1] != 0:
         slope = diff[0] / diff[1]
-        d = int(np.sign(diff[1]))  # step in y
+        d = int(np.sign(diff[1]))
         for i in range(abs(diff[1]) + 1):
             x = p1[0] + i*slope*d
             y = int(p1[1] + i*d)
-            x_ceil = int(np.ceil(x))
-            x_floor = int(np.floor(x))
-            if not is_traversable_for_planning(km[x_ceil, y]) and \
-               not is_traversable_for_planning(km[x_floor, y]):
+            xCeil = int(np.ceil(x)); xFloor = int(np.floor(x))
+            if not isTraversableForPlanning(km[xCeil, y]) and \
+               not isTraversableForPlanning(km[xFloor, y]):
                 return False
     return True
 
-# --- A* planner on (x,y,vx,vy) ------------------------------------------------
+# --------------------- Féktávolság segédfüggvények ----------------------------
+# ismert sarok-eset: ha fal közelebb van, mint a látósugár, ütközhetünk, hiába stimmel a háromszög-szabály
+def tri(n: int) -> int:
+    """Háromszögszám: n + (n-1) + ... + 1 = n*(n+1)//2"""
+    return n*(n+1)//2
+
+def brakingOk(vx: int, vy: int, rSafe: int) -> bool:
+    """
+    Féktávolság-invariáns komponensenként: T(|vx|)<=rSafe és T(|vy|)<=rSafe.
+
+    @param vx: sebesség x
+    @param vy: sebesség y
+    @param rSafe: biztonsági sugár (R - margin)
+    """
+    return (tri(abs(vx)) <= rSafe) and (tri(abs(vy)) <= rSafe)
+
+# -------------------------- A* állapotrácson ----------------------------------
 
 class AStarPlanner:
+    """
+    Egyszerű A* a (x,y,vx,vy) rácson, óvatos (féktáv) korlátozással és fordulási büntetéssel,
+    hogy ne forduljon vissza könnyen.
+    """
+
     def __init__(self,
                  world: WorldModel,
-                 v_max: int = 5,
-                 max_nodes: int = 20000):
+                 vMax: int,
+                 rSafe: int,
+                 maxNodes: int = 20000):
         self.world = world
-        self.v_max = v_max
-        self.max_nodes = max_nodes
+        self.v_max = vMax
+        self.R_safe = max(0, rSafe)
+        self.max_nodes = maxNodes
 
-    def heuristic_steps(self, pos: Tuple[int,int], target: Tuple[int,int]) -> float:
-        # admissible lower bound on steps: distance / (V_MAX+1)
+        # irányváltás büntetés paraméterei
+        self.turn_pen_back = 5.0
+        self.turn_pen_half = 2.0
+        self.turn_pen_ortho = 0.5
+
+    def heuristicSteps(self, pos: Tuple[int,int], target: Tuple[int,int]) -> float:
         dx = pos[0] - target[0]
         dy = pos[1] - target[1]
         dist = math.hypot(dx, dy)
+        # durva alsó korlát lépésekre
         return dist / (self.v_max + 1)
 
+    def _clampV(self, v: int) -> int:
+        return max(-self.v_max, min(self.v_max, v))
+
+    def _turnPenalty(self, vx: int, vy: int, nvx: int, nvy: int) -> float:
+        a = math.hypot(vx, vy); b = math.hypot(nvx, nvy)
+        if a == 0 or b == 0: return 0.0
+        cos = (vx*nvx + vy*nvy) / (a*b)
+        if cos < -0.5: return self.turn_pen_back
+        if cos < 0.0:  return self.turn_pen_half
+        if abs(cos) < 1e-9: return self.turn_pen_ortho
+        return 0.0
+
     def plan(self,
-             start_pos: Tuple[int,int],
-             start_vel: Tuple[int,int],
-             target_pos: Tuple[int,int]) -> Optional[List[Tuple[int,int]]]:
-        """
-        Returns a list of accelerations [(ax,ay), ...] from start to reach target_pos
-        (or a GOAL cell) under the world constraints. If no plan, returns None.
-        Only the FIRST action will be executed by the caller (receding horizon).
-        """
-        sx, sy = start_pos
-        svx, svy = start_vel
-        tx, ty = target_pos
+             startPos: Tuple[int,int],
+             startVel: Tuple[int,int],
+             targetPos: Tuple[int,int]) -> Optional[List[Tuple[int,int]]]:
+        sx, sy = startPos
+        svx, svy = startVel
+        tx, ty = targetPos
 
-        def clamp(v: int) -> int:
-            return max(-self.v_max, min(self.v_max, v))
-
-        start_state = (sx, sy, svx, svy)
-        # f = g + h; store g and parent/action
-        g_cost = { start_state: 0.0 }
+        startState = (sx, sy, svx, svy)
+        gCost = { startState: 0.0 }
         parent: dict[Tuple[int,int,int,int], Tuple[Tuple[int,int,int,int], Tuple[int,int]]] = {}
 
-        # priority queue: (f, counter, state)
-        counter = 0
         pq: List[Tuple[float,int,Tuple[int,int,int,int]]] = []
-        start_h = self.heuristic_steps((sx,sy), (tx,ty))
-        heapq.heappush(pq, (start_h, counter, start_state))
+        counter = 0
+        heapq.heappush(pq, (self.heuristicSteps((sx,sy),(tx,ty)), counter, startState))
         counter += 1
 
-        nodes_popped = 0
+        nodesPopped = 0
         km = self.world.known_map
 
-        def is_goal_cell(x: int, y: int) -> bool:
+        def isGoalCell(x: int, y: int) -> bool:
             return km[x,y] == CellType.GOAL.value or (x == tx and y == ty)
 
         while pq:
             _, _, (x, y, vx, vy) = heapq.heappop(pq)
-            nodes_popped += 1
-            if nodes_popped > self.max_nodes:
+            nodesPopped += 1
+            if nodesPopped > self.max_nodes:
                 return None
 
-            if is_goal_cell(x, y):
-                # reconstruct action sequence
+            if isGoalCell(x, y):
                 actions: List[Tuple[int,int]] = []
                 cur = (x, y, vx, vy)
-                while cur != start_state:
+                while cur != startState:
                     prev, act = parent[cur]
-                    actions.append(act)
-                    cur = prev
+                    actions.append(act); cur = prev
                 actions.reverse()
                 return actions
 
-            # expand neighbors
             for ax in (-1,0,1):
                 for ay in (-1,0,1):
-                    nvx = clamp(vx + ax)
-                    nvy = clamp(vy + ay)
+                    nvx = self._clampV(vx + ax)
+                    nvy = self._clampV(vy + ay)
+
+                    # Féktávolság-invariáns
+                    if not brakingOk(nvx, nvy, self.R_safe):
+                        continue
+
                     nx = x + nvx
                     ny = y + nvy
 
-                    # bounds & collision
                     if not (0 <= nx < km.shape[0] and 0 <= ny < km.shape[1]):
                         continue
-                    # unknown treated as blocked
-                    if not valid_line_on_map(self.world, np.array([x,y]), np.array([nx,ny])):
+                    if not validLineOnMap(self.world, np.array([x,y]), np.array([nx,ny])):
                         continue
 
-                    # one-step cost; optionally penalize huge speeds or near-wall
-                    step_cost = 1.0
-                    ns = (nx, ny, nvx, nvy)
-                    tentative = g_cost[(x,y,vx,vy)] + step_cost
+                    base = 1.0
+                    turnp = self._turnPenalty(vx,vy,nvx,nvy)
+                    stepCost = base + turnp
 
-                    if tentative < g_cost.get(ns, float("inf")):
-                        g_cost[ns] = tentative
+                    ns = (nx, ny, nvx, nvy)
+                    tentative = gCost[(x,y,vx,vy)] + stepCost
+                    if tentative < gCost.get(ns, float("inf")):
+                        gCost[ns] = tentative
                         parent[ns] = ((x,y,vx,vy), (ax,ay))
-                        h = self.heuristic_steps((nx,ny), (tx,ty))
-                        f = tentative + h
+                        f = tentative + self.heuristicSteps((nx,ny),(tx,ty))
                         heapq.heappush(pq, (f, counter, ns))
                         counter += 1
         return None
 
-# --- High-level decision-making ------------------------------------------------
+# -------------------------- Célválasztás --------------------------------------
 
-def choose_target(world: WorldModel, agent_xy: Tuple[int,int]) -> Tuple[str, Optional[Tuple[int,int]], Optional[List[Tuple[int,int]]]]:
+def chooseTarget(world: WorldModel, agentXY: Tuple[int,int]) -> Tuple[str, Optional[Tuple[int,int]], Optional[List[Tuple[int,int]]]]:
     """
-    Decide target:
-      - If any GOAL known: pick the closest (in (x,y) BFS sense).
-      - Else: go to nearest frontier (explore).
-    Returns (mode, target_cell, bfs_path_in_xy_space or None).
+    Először cél, ha nincs: legközelebbi frontier, ha az sincs: idle.
+
+    @return (mode, targetCell, pathToFrontierVagyNone)
     """
     km = world.known_map
-    H, W = km.shape
     goals = np.argwhere(km == CellType.GOAL.value)
-    mode = "explore"
-    target = None
-    bfs_xy_path = None
-
     if goals.size > 0:
-        # pick nearest goal cell (grid distance)
-        sx, sy = agent_xy
-        # simple nearest by L1
+        sx, sy = agentXY
         dists = [ (abs(int(x)-sx)+abs(int(y)-sy), (int(x),int(y))) for (x,y) in goals ]
         dists.sort()
-        target = dists[0][1]
-        mode = "goal"
-        bfs_xy_path = None
-    else:
-        # nearest frontier
-        path = world.nearest_frontier_from(agent_xy)
-        if path is not None and len(path) > 0:
-            target = path[-1]
-            bfs_xy_path = path
-            mode = "explore"
-        else:
-            target = None
-            bfs_xy_path = None
-    return mode, target, bfs_xy_path
+        return "goal", dists[0][1], None
+    path = world.nearestFrontierFrom(agentXY)
+    if path:
+        return "explore", path[-1], path
+    return "idle", None, None
 
-# --- Fallback (safe-ish) move --------------------------------------------------
+# ----------------------- Fallback (féktáv + forward bias) ---------------------
 
-def fallback_move(rng: np.random.Generator, state: State) -> Tuple[int,int]:
+def fallbackMoveWithBrakeAndBias(state: State, rSafe: int) -> Tuple[int,int]:
     """
-    A nagyon egyszerű baseline (az eredeti váz logikája) – ha nincs terv.
-    Visszaad egy (ax, ay)-t.
+    Laza tartalék: érvényes vonal + féktáv feltétel, és preferált irány: v·v' >= 0.
+
+    @param state: látott ablak + agent
+    @param rSafe: R - margin
     """
-    self_pos = state.agent.pos
+    assert state.agent is not None
+    selfPos = state.agent.pos
+    v = state.agent.vel
+    vx, vy = int(v[0]), int(v[1])
+
     def traversable(cell_value: int) -> bool:
         return cell_value >= 0
 
-    def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
+    def validLineLocal(pos1: np.ndarray, pos2: np.ndarray) -> bool:
         track = state.visible_track
         if (np.any(pos1 < 0) or np.any(pos2 < 0) or np.any(pos1 >= track.shape)
                 or np.any(pos2 >= track.shape)):
             return False
         diff = pos2 - pos1
         if diff[0] != 0:
-            slope = diff[1] / diff[0]
-            d = np.sign(diff[0])
+            slope = diff[1] / diff[0]; d = np.sign(diff[0])
             for i in range(abs(diff[0]) + 1):
-                x = int(pos1[0] + i*d)
-                y = pos1[1] + i*slope*d
-                y_ceil = int(np.ceil(y))
-                y_floor = int(np.floor(y))
-                if (not traversable(track[x, y_ceil])
-                        and not traversable(track[x, y_floor])):
-                    return False
+                x = int(pos1[0] + i*d); y = pos1[1] + i*slope*d
+                yCeil = int(np.ceil(y)); yFloor = int(np.floor(y))
+                if (not traversable(track[x, yCeil]) and
+                    not traversable(track[x, yFloor])): return False
         if diff[1] != 0:
-            slope = diff[0] / diff[1]
-            d = np.sign(diff[1])
+            slope = diff[0] / diff[1]; d = np.sign(diff[1])
             for i in range(abs(diff[1]) + 1):
-                x = pos1[0] + i*slope*d
-                y = int(pos1[1] + i*d)
-                x_ceil = int(np.ceil(x))
-                x_floor = int(np.floor(x))
-                if (not traversable(track[x_ceil, y])
-                        and not traversable(track[x_floor, y])):
-                    return False
+                x = pos1[0] + i*slope*d; y = int(pos1[1] + i*d)
+                xCeil = int(np.ceil(x)); xFloor = int(np.floor(x))
+                if (not traversable(track[xCeil, y]) and
+                    not traversable(track[xFloor, y])): return False
         return True
 
-    def valid_move(next_move):
-        return (valid_line(state, self_pos, next_move) and
-                (np.all(next_move == self_pos)
-                 or not any(np.all(next_move == p.pos) for p in state.players)))
+    newCenter = selfPos + v
+    candidates: List[Tuple[Tuple[int,int], float]] = []  # ((ax,ay), rank)
 
-    new_center = self_pos + state.agent.vel
-    next_move = new_center
-    if (np.any(next_move != self_pos) and valid_move(next_move) and rng.random() > 0.1):
+    for ax in (-1,0,1):
+        for ay in (-1,0,1):
+            nvx, nvy = vx + ax, vy + ay
+            if not brakingOk(nvx, nvy, rSafe):
+                continue
+            nextMove = newCenter + np.array([ax, ay])
+            if not validLineLocal(selfPos, nextMove):
+                continue
+            # forward bias: rangsor
+            a = math.hypot(vx, vy); b = math.hypot(nvx, nvy)
+            rank = 1.0
+            if a > 0 and b > 0:
+                cos = (vx*nvx + vy*nvy) / (a*b)
+                if cos > 0:      rank = 0.0   # előre
+                elif cos == 0:   rank = 0.5   # oldal
+                elif cos < 0:    rank = 2.0   # vissza
+            elif a == 0 and b > 0:
+                rank = 0.8  # nulláról elindulás – oké
+            elif b == 0:
+                rank = 1.2  # megállás – közepes
+            candidates.append(((ax, ay), rank))
+
+    if not candidates:
+        # Nincs semmi értelmes: fékezzünk, ha lehet, különben 0,0
+        ax = -1 if vx > 0 else (1 if vx < 0 else 0)
+        ay = -1 if vy > 0 else (1 if vy < 0 else 0)
+        if brakingOk(vx+ax, vy+ay, rSafe):
+            return (ax, ay)
         return (0, 0)
-    else:
-        valid_moves = []
-        valid_stay = None
-        for i in range(-1, 2):
-            for j in range(-1, 2):
-                next_move = new_center + np.array([i, j])
-                if valid_move(next_move):
-                    if np.all(self_pos == next_move):
-                        valid_stay = (i, j)
-                    else:
-                        valid_moves.append((i, j))
-        if valid_moves:
-            return tuple(rng.choice(valid_moves))
-        elif valid_stay is not None:
-            return valid_stay
-        else:
-            print('Not blind, just being brave! (No valid action found.)', file=sys.stderr)
-            return (0, 0)
 
-# --- Main loop ----------------------------------------------------------------
+    candidates.sort(key=lambda it: it[1])
+    return candidates[0][0]
 
-def calculate_move(world: WorldModel, planner: AStarPlanner,
-                   rng: np.random.Generator, state: State) -> Tuple[int,int]:
+# ---------------------------- Fő döntés ---------------------------------------
+
+def calculateMove(world: WorldModel, planner: AStarPlanner,
+                  rng: np.random.Generator, state: State) -> Tuple[int,int]:
     """
-    One full decision:
-      1) Update world model from observation
-      2) Choose target (goal or frontier)
-      3) Plan with A* on (x,y,vx,vy)
-      4) Execute only FIRST (ax,ay) (receding horizon)
-      5) Log details
+    A* (receding horizon): csak az első akciót hajtjuk végre.
+    Ha nincs cél vagy nincs terv: fallback, de ugyanúgy féktávolság-őrült óvatos.
+
+    @return (ax, ay)
     """
     assert state.agent is not None
     assert state.visible_raw is not None
 
-    # 1) Integrate observation
-    world.update_with_observation(state)
+    world.updateWithObservation(state)
 
-    ax, ay = 0, 0  # default if everything fails
+    R = state.circuit.visibility_radius
+    SAFETY_MARGIN = 1
+    rSafe = max(0, R - SAFETY_MARGIN)
 
-    # 2) Target selection
-    agent_xy = (int(state.agent.x), int(state.agent.y))
-    agent_v  = (int(state.agent.vel_x), int(state.agent.vel_y))
+    agentXY = (int(state.agent.x), int(state.agent.y))
+    agentV  = (int(state.agent.vel_x), int(state.agent.vel_y))
 
-    mode, target, _xy_path = choose_target(world, agent_xy)
+    mode, target, _ = chooseTarget(world, agentXY)
 
-    # 3) Plan (A*) if we have a target
+    # A*: csak az első akciót hajtjuk végre (receding horizon)
     if target is not None:
-        actions = planner.plan(agent_xy, agent_v, target)
+        actions = planner.plan(agentXY, agentV, target)
         if actions:
             ax, ay = actions[0]
         else:
-            # No plan found → fallback
-            ax, ay = fallback_move(rng, state)
+            ax, ay = fallbackMoveWithBrakeAndBias(state, rSafe)
             mode += "+fallback(no-plan)"
     else:
-        # No target (fully known, or boxed in) → fallback
-        ax, ay = fallback_move(rng, state)
+        ax, ay = fallbackMoveWithBrakeAndBias(state, rSafe)
         mode += "+fallback(no-target)"
 
-    # Avoid immediate collision with other players (current positions)
-    next_pos = state.agent.pos + state.agent.vel + np.array([ax, ay])
-    if any(np.all(next_pos == p.pos) for p in state.players):
-        # be conservative: cancel accel
+    # Extra óvatosság: ha ütköznénk játékossal, fékezzünk
+    nextPos = state.agent.pos + state.agent.vel + np.array([ax, ay])
+    if any(np.all(nextPos == p.pos) for p in state.players):
         ax, ay = 0, 0
         mode += "+avoid-player"
 
-    # Stats/log
-    world.visited_count[agent_xy[0], agent_xy[1]] += 1
-    targ_str = f"{target[0]} {target[1]}" if target is not None else "None"
-    log_info(f"MODE={mode} | POS=({agent_xy[0]},{agent_xy[1]}) "
-             f"VEL=({agent_v[0]},{agent_v[1]}) TARGET=({targ_str}) ACT=({ax},{ay})")
+    # Log: állapot + cél + akció + féktáv-ok
+    vx1, vy1 = agentV
+    stopDX, stopDY = tri(abs(vx1)), tri(abs(vy1))
+    logInfo(
+        f"MODE={mode} | POS=({agentXY[0]},{agentXY[1]}) "
+        f"VEL=({vx1},{vy1}) STOP_TRI=({stopDX},{stopDY}) rSafe={rSafe} "
+        f"TARGET=({('None' if target is None else f'{target[0]} {target[1]}')}) "
+        f"ACT=({ax},{ay})"
+    )
+
+    world.visited_count[agentXY[0], agentXY[1]] += 1
     return ax, ay
 
+# -------------------------------- main ----------------------------------------
+
 def main():
-    log_info("Session start")
-    circuit = read_initial_observation()
-    # initial stub state
+    logInfo("Session start")
+    circuit = readInitialObservation()
     state: Optional[State] = State(circuit, None, None, [], None)
 
-    # world + planner
     world = WorldModel(circuit.track_shape)
-    planner = AStarPlanner(world, v_max=5, max_nodes=20000)
 
+    # v_max maradhat nagyobb is, a féktáv ellenőrzés lesz a szigorúbb korlát
+    R = circuit.visibility_radius
+    SAFETY_MARGIN = 1
+    rSafe = max(0, R - SAFETY_MARGIN)
+
+    planner = AStarPlanner(world, vMax=7, rSafe=rSafe, maxNodes=30000)
     rng = np.random.default_rng(seed=1)
 
     while True:
         assert state is not None
-        state = read_observation(state)
+        state = readObservation(state)
         if state is None:
-            log_info("Judge signaled end (~~~END~~~)")
-            # (optional) dump visited counts to CSV:
-            # np.savetxt("visited_count.csv", world.visited_count, fmt="%d", delimiter=",")
+            logInfo("Judge signaled end (~~~END~~~)")
             return
-        ax, ay = calculate_move(world, planner, rng, state)
-        send_agent_move(ax, ay)
+        ax, ay = calculateMove(world, planner, rng, state)
+        sendAgentMove(ax, ay)
 
 if __name__ == "__main__":
     main()
