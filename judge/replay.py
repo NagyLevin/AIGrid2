@@ -107,7 +107,7 @@ def _construct_dataclass(target_cls: type[T], obj: dict[str] | Any, *,
                 raise TypeError(f'More than one types in {target_cls} match '
                                 'the given dict object.')
             else:
-                return _create_dataclass_recursive(concrete_cls[0], obj)
+                return _create_dataclass_recursive(concrete_cls[0], obj, allow_extra_keys=allow_extra_keys)
         elif isinstance(obj, collections.abc.Sequence):
             # target cls should be a list (tuples are not supported)
             concrete_cls = [
@@ -198,17 +198,13 @@ def _create_dataclass_recursive(target_cls: type[Dataclass], obj: dict, *,
     assert dataclasses.is_dataclass(target_cls), 'Dataclass expected'
     fields = {f.name: f.type for f in dataclasses.fields(target_cls)}
     if allow_extra_keys:
-        try:
-            typed_obj = {
-                fname:
-                    _construct_dataclass(
-                        ftype, obj[fname], allow_extra_keys=allow_extra_keys)
-                for fname, ftype in fields.items()
-            }
-        except KeyError as e:
-            raise TypeError(
-                f'Missing entry "{e.args[0]}" from replay file; needed '
-                f'to construct `{target_cls}`.') from e
+        typed_obj = {
+            fname:
+                _construct_dataclass(
+                    ftype, obj[fname], allow_extra_keys=allow_extra_keys)
+            for fname, ftype in fields.items()
+            if fname in obj
+        }
     else:
         try:
             typed_obj = {
@@ -220,7 +216,11 @@ def _create_dataclass_recursive(target_cls: type[Dataclass], obj: dict, *,
         except KeyError as e:
             raise TypeError(f'Extra entry in replay file: "{e.args[0]}" for '
                             f'target class: {target_cls}') from e
-    return target_cls(**typed_obj)
+    try:
+        return target_cls(**typed_obj)
+    except TypeError as e:
+        raise TypeError(f'Missing entry from replay file; it is needed '
+                        f'to construct `{target_cls}`: {e}') from e
 
 def deserialise(fname: str, *, allow_extra_keys: bool = False) -> Replay:
     with open(fname, 'r') as f:

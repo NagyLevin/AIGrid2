@@ -158,6 +158,7 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
             return (0, 0)
 
 def main():
+    print('READY', flush=True)
     circuit = read_initial_observation()
     state: Optional[State] = State(circuit, None, [], None)  # type: ignore
     rng = np.random.default_rng(seed=1)
@@ -167,7 +168,7 @@ def main():
         if state is None:
             return
         delta = calculate_move(rng, state)
-        print(f'{delta[0]} {delta[1]}')
+        print(f'{delta[0]} {delta[1]}', flush=True)
 
 if __name__ == "__main__":
     main()

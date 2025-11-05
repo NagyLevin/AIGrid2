@@ -72,6 +72,7 @@ class GridRaceEnv(judge.EnvironmentBase):
         if current_player is None:
             # Should start with player #0
             assert next(self.players_iterator) == 0
+            assert self.num_players > 0
             return 0
         while True:  # repeat until player is not in penalty
             # look for the next player
