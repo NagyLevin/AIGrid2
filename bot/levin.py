@@ -2,7 +2,7 @@ import sys
 import enum
 import math
 import heapq
-from collections import deque
+from collections import deque, defaultdict
 import numpy as np
 from typing import Optional, NamedTuple, Tuple, List
 
@@ -102,6 +102,12 @@ class WorldModel:
         self.shape = shape
         self.known_map = np.full((H, W), CellType.UNKNOWN.value, dtype=int)
         self.visited_count = np.zeros((H, W), dtype=int)
+        # Directed edge traversal counts: key = (x,y,nx,ny)
+        self.edge_visits: defaultdict[tuple[int,int,int,int], int] = defaultdict(int)
+
+        # --- DFS memory ---
+        self.dfs_stack: List[Tuple[int,int]] = []              # junction checkpoints
+        self.dfs_expanded_edges: set[tuple[int,int,int,int]] = set()  # expanded directed edges
 
     def updateWithObservation(self, st: State) -> None:
         raw = st.visible_raw
@@ -110,7 +116,7 @@ class WorldModel:
         seen = (raw != CellType.NOT_VISIBLE.value)
         self.known_map[seen] = raw[seen]
 
-    # ---- Frontier detection ----
+    # ---- Basic traversability helpers ----
     def _trav(self, v: int) -> bool:
         return (v >= 0) and (v != CellType.UNKNOWN.value)
 
@@ -120,6 +126,28 @@ class WorldModel:
             if 0 <= nx < self.shape[0] and 0 <= ny < self.shape[1]:
                 yield nx, ny
 
+    def traversable_neighbors(self, x: int, y: int) -> List[Tuple[int,int]]:
+        km = self.known_map
+        out = []
+        for nx, ny in self._n4(x, y):
+            if self._trav(km[nx, ny]):
+                out.append((nx, ny))
+        return out
+
+    def degree(self, x: int, y: int) -> int:
+        return len(self.traversable_neighbors(x, y))
+
+    def is_frontier_cell(self, x: int, y: int) -> bool:
+        # Traversable cell that touches UNKNOWN
+        km = self.known_map
+        if not self._trav(km[x,y]):
+            return False
+        for nx, ny in self._n4(x, y):
+            if km[nx, ny] == CellType.UNKNOWN.value:
+                return True
+        return False
+
+    # ---- Frontier detection (BFS fallback) ----
     def frontierCells(self) -> List[Tuple[int,int]]:
         km = self.known_map
         H, W = self.shape
@@ -156,6 +184,47 @@ class WorldModel:
                 if self._trav(self.known_map[nx,ny]):
                     prev[(nx,ny)] = (x,y); q.append((nx,ny))
         return None
+
+    # ---- Edge helpers (anti-oscillation & DFS) ----
+    def edge_count(self, x: int, y: int, nx: int, ny: int) -> int:
+        return self.edge_visits[(x, y, nx, ny)]
+
+    def touch_edge(self, x: int, y: int, nx: int, ny: int) -> None:
+        self.edge_visits[(x, y, nx, ny)] += 1
+
+    # --- DFS helpers ---
+    def dfs_edge_expanded(self, x: int, y: int, nx: int, ny: int) -> bool:
+        return (x, y, nx, ny) in self.dfs_expanded_edges
+
+    def record_dfs_traverse(self, x: int, y: int, nx: int, ny: int) -> None:
+        # record the directed edge we actually traversed this turn
+        self.dfs_expanded_edges.add((x, y, nx, ny))
+
+    def has_unexpanded_from(self, x: int, y: int) -> bool:
+        for nx, ny in self.traversable_neighbors(x, y):
+            if not self.dfs_edge_expanded(x, y, nx, ny):
+                return True
+        return False
+
+    def prune_dfs_stack(self) -> None:
+        # Pop exhausted junctions
+        while self.dfs_stack and not self.has_unexpanded_from(*self.dfs_stack[-1]):
+            self.dfs_stack.pop()
+
+    def update_dfs_stack_at(self, cur: Tuple[int,int]) -> None:
+        cx, cy = cur
+        # push junctions (deg>=3) as checkpoints if not already top
+        if self.degree(cx, cy) >= 3:
+            if not self.dfs_stack or self.dfs_stack[-1] != (cx, cy):
+                # avoid duplicates deeper in stack (loop closure)
+                if (cx, cy) in self.dfs_stack:
+                    # keep the earlier ones up to this occurrence
+                    idx = self.dfs_stack.index((cx, cy))
+                    self.dfs_stack = self.dfs_stack[:idx+1]
+                else:
+                    self.dfs_stack.append((cx, cy))
+        # prune any exhausted junctions on top
+        self.prune_dfs_stack()
 
 # ---- Geometry & safety ----
 
@@ -231,7 +300,7 @@ def tri(n: int) -> int:
 def brakingOk(vx: int, vy: int, rSafe: int) -> bool:
     return (tri(abs(vx)) <= rSafe) and (tri(abs(vy)) <= rSafe)
 
-# ---- A* planner on (x,y,vx,vy) ----
+# ---- A* planner on (x,y,vx,vy) with anti-oscillation costs ----
 
 class AStarPlanner:
     def __init__(self, world: WorldModel, vMax: int, rSafe: int, maxNodes: int = 20000):
@@ -239,9 +308,14 @@ class AStarPlanner:
         self.v_max = vMax
         self.R_safe = max(0, rSafe)
         self.max_nodes = maxNodes
-        self.turn_pen_back = 5.0
+        # turning penalties
+        self.turn_pen_back = 6.0
         self.turn_pen_half = 2.0
         self.turn_pen_ortho = 0.5
+        # anti-oscillation weights
+        self.w_backtrack = 4.0     # stepping back to previous cell
+        self.w_edge_repeat = 0.7   # repeating the same directed edge
+        self.w_visit = 0.05        # revisiting frequently seen cells
 
     def heuristicSteps(self, pos: Tuple[int,int], target: Tuple[int,int]) -> float:
         dx = pos[0] - target[0]
@@ -294,6 +368,9 @@ class AStarPlanner:
                 actions.reverse()
                 return actions
 
+            # previous cell (exact kinematics identity): p_{t-1} = p_t - v_t
+            prev_x, prev_y = (x - vx, y - vy)
+
             for ax in (-1,0,1):
                 for ay in (-1,0,1):
                     nvx = self._clampV(vx + ax)
@@ -310,7 +387,13 @@ class AStarPlanner:
 
                     base = 1.0
                     turnp = self._turnPenalty(vx,vy,nvx,nvy)
-                    stepCost = base + turnp
+
+                    # --- Anti-oscillation extras ---
+                    backtrack_pen = self.w_backtrack if (nx == prev_x and ny == prev_y) else 0.0
+                    edge_rep_pen = self.w_edge_repeat * float(self.world.edge_count(x, y, nx, ny))
+                    visit_pen = self.w_visit * float(self.world.visited_count[nx, ny])
+
+                    stepCost = base + turnp + backtrack_pen + edge_rep_pen + visit_pen
 
                     ns = (nx, ny, nvx, nvy)
                     tentative = gCost[(x,y,vx,vy)] + stepCost
@@ -322,31 +405,59 @@ class AStarPlanner:
                         counter += 1
         return None
 
-# ---- Target selection ----
+# ---- DFS-first Target selection ----
 
-def chooseTarget(world: WorldModel, agentXY: Tuple[int,int]) -> Tuple[str, Optional[Tuple[int,int]], Optional[List[Tuple[int,int]]]]:
+def chooseTargetDFS(world: WorldModel, agentXY: Tuple[int,int]) -> Tuple[str, Optional[Tuple[int,int]]]:
+    """
+    DFS policy on the grid graph (known traversable cells).
+    - Extend along an unexpanded neighbor (frontier-biased) if any.
+    - Else backtrack to nearest junction with remaining branches.
+    - Else None.
+    """
     km = world.known_map
-    goals = np.argwhere(km == CellType.GOAL.value)
-    if goals.size > 0:
-        sx, sy = agentXY
-        dists = [ (abs(int(x)-sx)+abs(int(y)-sy), (int(x),int(y))) for (x,y) in goals ]
-        dists.sort()
-        return "goal", dists[0][1], None
-    path = world.nearestFrontierFrom(agentXY)
-    if path:
-        return "explore", path[-1], path
-    return "idle", None, None
 
-# ---- Local fallback (visibility-safe + forward bias) ----
+    # 1) If GOAL is known anywhere, let higher layer handle it outside.
+    # (We check goals outside this function.)
 
-def fallbackMoveWithBrakeAndBias(state: State, rSafe: int) -> Tuple[int,int]:
+    # 2) Maintain stack with current position context.
+    world.update_dfs_stack_at(agentXY)
+
+    x, y = agentXY
+    if not (0 <= x < km.shape[0] and 0 <= y < km.shape[1]) or not world._trav(km[x,y]):
+        return "idle", None
+
+    # 3) Try to extend DFS from current cell: prefer unexpanded edges.
+    neighbors = world.traversable_neighbors(x, y)
+
+    # Partition neighbors by frontier bias first
+    unexpanded = [(nx, ny) for (nx, ny) in neighbors if not world.dfs_edge_expanded(x, y, nx, ny)]
+    if unexpanded:
+        frontier_first = [(nx, ny) for (nx, ny) in unexpanded if world.is_frontier_cell(nx, ny)]
+        pool = frontier_first if frontier_first else unexpanded
+        # Choose least visited to reduce loops
+        pool.sort(key=lambda p: (world.visited_count[p[0], p[1]]))
+        return "dfs_extend", pool[0]
+
+    # 4) No local unexpanded edges -> backtrack to nearest junction with remaining branches
+    world.prune_dfs_stack()
+    if world.dfs_stack:
+        return "dfs_backtrack", world.dfs_stack[-1]
+
+    # 5) No DFS target -> None (let caller try BFS frontier or fallback)
+    return "idle", None
+
+# ---- Local fallback (visibility-safe + forward/novelty bias) ----
+
+def fallbackMoveWithBrakeAndBias(state: State, world: WorldModel, rSafe: int) -> Tuple[int,int]:
     assert state.agent is not None
     selfPos = state.agent.pos
     v = state.agent.vel
     vx, vy = int(v[0]), int(v[1])
 
+    last_pos = selfPos - v  # exact previous cell by kinematics
+
     newCenter = selfPos + v
-    candidates: List[Tuple[Tuple[int,int], float]] = []  # ((ax,ay), rank)
+    candidates: List[Tuple[Tuple[int,int], float, Tuple[int,int]]] = []  # ((ax,ay), rank, (nx,ny))
 
     for ax in (-1,0,1):
         for ay in (-1,0,1):
@@ -354,31 +465,47 @@ def fallbackMoveWithBrakeAndBias(state: State, rSafe: int) -> Tuple[int,int]:
             if not brakingOk(nvx, nvy, rSafe):
                 continue
             nextMove = newCenter + np.array([ax, ay])
+            nx, ny = int(nextMove[0]), int(nextMove[1])
             if not validLineLocal(state, selfPos, nextMove):
                 continue
-            # forward bias
+
+            # base rank and forward bias
             a = math.hypot(vx, vy); b = math.hypot(nvx, nvy)
             rank = 1.0
             if a > 0 and b > 0:
                 cos = (vx*nvx + vy*nvy) / (a*b)
-                if   cos > 0: rank = 0.0
-                elif cos == 0: rank = 0.5
-                else: rank = 2.0
+                if   cos > 0: rank -= 0.4
+                elif cos == 0: rank += 0.2
+                else: rank += 1.5
             elif a == 0 and b > 0:
-                rank = 0.8
+                rank -= 0.1
             elif b == 0:
-                rank = 1.2
-            candidates.append(((ax, ay), rank))
+                rank += 0.3
+
+            # --- Anti-oscillation extras (local) ---
+            if nx == int(last_pos[0]) and ny == int(last_pos[1]):
+                rank += 3.0  # avoid immediate backtrack unless necessary
+
+            rank += 0.6 * float(world.edge_count(int(selfPos[0]), int(selfPos[1]), nx, ny))
+            rank += 0.05 * float(world.visited_count[nx, ny])
+
+            candidates.append(((ax, ay), rank, (nx, ny)))
 
     if not candidates:
+        # gentle brake towards zero velocity
         ax = -1 if vx > 0 else (1 if vx < 0 else 0)
         ay = -1 if vy > 0 else (1 if vy < 0 else 0)
         if brakingOk(vx+ax, vy+ay, rSafe):
             return (ax, ay)
         return (0, 0)
 
-    candidates.sort(key=lambda it: it[1])
-    return candidates[0][0]
+    # Prefer those that are not immediate backtracks when possible
+    non_back = [c for c in candidates if c[2] != (int(last_pos[0]), int(last_pos[1]))]
+    pool = non_back if non_back else candidates
+
+    pool.sort(key=lambda it: it[1])
+    best_axay = pool[0][0]
+    return best_axay
 
 # ---- Decision (receding horizon) ----
 
@@ -396,23 +523,58 @@ def calculateMove(world: WorldModel, planner: AStarPlanner,
     agentXY = (int(state.agent.x), int(state.agent.y))
     agentV  = (int(state.agent.vel_x), int(state.agent.vel_y))
 
-    mode, target, _ = chooseTarget(world, agentXY)
-
-    if target is not None:
+    # --- Priority 1: if any GOAL is known, go for it
+    km = world.known_map
+    goals = np.argwhere(km == CellType.GOAL.value)
+    if goals.size > 0:
+        sx, sy = agentXY
+        dists = [ (abs(int(x)-sx)+abs(int(y)-sy), (int(x),int(y))) for (x,y) in goals ]
+        dists.sort()
+        target = dists[0][1]
         actions = planner.plan(agentXY, agentV, target)
         if actions:
             ax, ay = actions[0]
         else:
-            ax, ay = fallbackMoveWithBrakeAndBias(state, rSafe)
+            ax, ay = fallbackMoveWithBrakeAndBias(state, world, rSafe)
     else:
-        ax, ay = fallbackMoveWithBrakeAndBias(state, rSafe)
+        # --- DFS-first target selection
+        mode, target = chooseTargetDFS(world, agentXY)
+
+        if target is None or mode == "idle":
+            # Try BFS to nearest frontier as a graceful fallback
+            path = world.nearestFrontierFrom(agentXY)
+            if path and len(path) > 0:
+                target = path[-1]
+                actions = planner.plan(agentXY, agentV, target)
+                if actions:
+                    ax, ay = actions[0]
+                else:
+                    ax, ay = fallbackMoveWithBrakeAndBias(state, world, rSafe)
+            else:
+                ax, ay = fallbackMoveWithBrakeAndBias(state, world, rSafe)
+        else:
+            # Plan to DFS target (neighbor or backtrack junction)
+            actions = planner.plan(agentXY, agentV, target)
+            if actions:
+                ax, ay = actions[0]
+            else:
+                # If planner fails, try safe local move
+                ax, ay = fallbackMoveWithBrakeAndBias(state, world, rSafe)
 
     # avoid stepping onto another player's cell
     nextPos = state.agent.pos + state.agent.vel + np.array([ax, ay])
     if any(np.all(nextPos == p.pos) for p in state.players):
         ax, ay = 0, 0
+        nextPos = state.agent.pos + state.agent.vel + np.array([ax, ay])
 
+    # update visit counts (node + edge) to discourage retracing
     world.visited_count[agentXY[0], agentXY[1]] += 1
+    nx, ny = int(nextPos[0]), int(nextPos[1])
+    world.touch_edge(agentXY[0], agentXY[1], nx, ny)
+
+    # --- Record DFS traversal on the actual directed edge we took this turn
+    world.record_dfs_traverse(agentXY[0], agentXY[1], nx, ny)
+
     return ax, ay
 
 # ---- main: strict I/O (only READY + moves on stdout) ----
