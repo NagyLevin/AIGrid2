@@ -4,7 +4,7 @@ import math
 import heapq
 from collections import deque, defaultdict
 import numpy as np
-from typing import Optional, NamedTuple, Tuple, List
+from typing import Optional, NamedTuple, Tuple, List, Dict
 
 # ---- Judge-compatible basic types ----
 
@@ -105,10 +105,6 @@ class WorldModel:
         # Directed edge traversal counts: key = (x,y,nx,ny)
         self.edge_visits: defaultdict[tuple[int,int,int,int], int] = defaultdict(int)
 
-        # --- DFS memory ---
-        self.dfs_stack: List[Tuple[int,int]] = []              # junction checkpoints
-        self.dfs_expanded_edges: set[tuple[int,int,int,int]] = set()  # expanded directed edges
-
     def updateWithObservation(self, st: State) -> None:
         raw = st.visible_raw
         if raw is None:
@@ -116,7 +112,7 @@ class WorldModel:
         seen = (raw != CellType.NOT_VISIBLE.value)
         self.known_map[seen] = raw[seen]
 
-    # ---- Basic traversability helpers ----
+    # ---- Frontier detection ----
     def _trav(self, v: int) -> bool:
         return (v >= 0) and (v != CellType.UNKNOWN.value)
 
@@ -126,28 +122,6 @@ class WorldModel:
             if 0 <= nx < self.shape[0] and 0 <= ny < self.shape[1]:
                 yield nx, ny
 
-    def traversable_neighbors(self, x: int, y: int) -> List[Tuple[int,int]]:
-        km = self.known_map
-        out = []
-        for nx, ny in self._n4(x, y):
-            if self._trav(km[nx, ny]):
-                out.append((nx, ny))
-        return out
-
-    def degree(self, x: int, y: int) -> int:
-        return len(self.traversable_neighbors(x, y))
-
-    def is_frontier_cell(self, x: int, y: int) -> bool:
-        # Traversable cell that touches UNKNOWN
-        km = self.known_map
-        if not self._trav(km[x,y]):
-            return False
-        for nx, ny in self._n4(x, y):
-            if km[nx, ny] == CellType.UNKNOWN.value:
-                return True
-        return False
-
-    # ---- Frontier detection (BFS fallback) ----
     def frontierCells(self) -> List[Tuple[int,int]]:
         km = self.known_map
         H, W = self.shape
@@ -185,46 +159,12 @@ class WorldModel:
                     prev[(nx,ny)] = (x,y); q.append((nx,ny))
         return None
 
-    # ---- Edge helpers (anti-oscillation & DFS) ----
+    # Edge helpers
     def edge_count(self, x: int, y: int, nx: int, ny: int) -> int:
         return self.edge_visits[(x, y, nx, ny)]
 
     def touch_edge(self, x: int, y: int, nx: int, ny: int) -> None:
         self.edge_visits[(x, y, nx, ny)] += 1
-
-    # --- DFS helpers ---
-    def dfs_edge_expanded(self, x: int, y: int, nx: int, ny: int) -> bool:
-        return (x, y, nx, ny) in self.dfs_expanded_edges
-
-    def record_dfs_traverse(self, x: int, y: int, nx: int, ny: int) -> None:
-        # record the directed edge we actually traversed this turn
-        self.dfs_expanded_edges.add((x, y, nx, ny))
-
-    def has_unexpanded_from(self, x: int, y: int) -> bool:
-        for nx, ny in self.traversable_neighbors(x, y):
-            if not self.dfs_edge_expanded(x, y, nx, ny):
-                return True
-        return False
-
-    def prune_dfs_stack(self) -> None:
-        # Pop exhausted junctions
-        while self.dfs_stack and not self.has_unexpanded_from(*self.dfs_stack[-1]):
-            self.dfs_stack.pop()
-
-    def update_dfs_stack_at(self, cur: Tuple[int,int]) -> None:
-        cx, cy = cur
-        # push junctions (deg>=3) as checkpoints if not already top
-        if self.degree(cx, cy) >= 3:
-            if not self.dfs_stack or self.dfs_stack[-1] != (cx, cy):
-                # avoid duplicates deeper in stack (loop closure)
-                if (cx, cy) in self.dfs_stack:
-                    # keep the earlier ones up to this occurrence
-                    idx = self.dfs_stack.index((cx, cy))
-                    self.dfs_stack = self.dfs_stack[:idx+1]
-                else:
-                    self.dfs_stack.append((cx, cy))
-        # prune any exhausted junctions on top
-        self.prune_dfs_stack()
 
 # ---- Geometry & safety ----
 
@@ -300,7 +240,86 @@ def tri(n: int) -> int:
 def brakingOk(vx: int, vy: int, rSafe: int) -> bool:
     return (tri(abs(vx)) <= rSafe) and (tri(abs(vy)) <= rSafe)
 
-# ---- A* planner on (x,y,vx,vy) with anti-oscillation costs ----
+# ---- NEW: fast 2D coarse planner (positions only) ----
+
+class CoarsePlanner2D:
+    """
+    Fast A* over (x,y), diagonals allowed. Unknown cells are allowed but costly,
+    so it eagerly explores toward the goal without getting stuck waiting.
+    """
+    def __init__(self, world: WorldModel):
+        self.world = world
+        # costs
+        self.cost_unknown = 5.0  # soft-allow UNKNOWN to push through fog
+        self.cost_empty = 1.0
+        self.cost_goal = 1.0
+
+    def _neighbors8(self, x: int, y: int):
+        for dx, dy in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)):
+            nx, ny = x+dx, y+dy
+            if 0 <= nx < self.world.shape[0] and 0 <= ny < self.world.shape[1]:
+                yield nx, ny, (1.41421356 if dx and dy else 1.0)
+
+    def _cell_cost(self, v: int) -> float:
+        if v == CellType.WALL.value:
+            return float("inf")
+        if v == CellType.GOAL.value:
+            return self.cost_goal
+        if v == CellType.UNKNOWN.value:
+            return self.cost_unknown
+        # EMPTY/START/etc.
+        return self.cost_empty
+
+    def plan_path(self, start: Tuple[int,int], target: Tuple[int,int]) -> Optional[List[Tuple[int,int]]]:
+        sx, sy = start
+        tx, ty = target
+        km = self.world.known_map
+        if not (0 <= sx < km.shape[0] and 0 <= sy < km.shape[1]): return None
+        if not (0 <= tx < km.shape[0] and 0 <= ty < km.shape[1]): return None
+        if km[tx,ty] == CellType.WALL.value:
+            return None
+
+        def h(x: int, y: int) -> float:
+            return math.hypot(x-tx, y-ty)
+
+        start_cost = 0.0
+        g: Dict[Tuple[int,int], float] = {(sx,sy): start_cost}
+        parent: Dict[Tuple[int,int], Tuple[int,int]] = {}
+        pq: List[Tuple[float, int, Tuple[int,int]]] = []
+        rid = 0
+        heapq.heappush(pq, (h(sx,sy), rid, (sx,sy))); rid += 1
+        seen = set()
+
+        while pq:
+            _, _, (x,y) = heapq.heappop(pq)
+            if (x,y) in seen: 
+                continue
+            seen.add((x,y))
+
+            if (x,y) == (tx,ty) or km[x,y] == CellType.GOAL.value:
+                # reconstruct
+                path = []
+                cur = (x,y)
+                while cur != (sx,sy):
+                    path.append(cur); cur = parent[cur]
+                path.append((sx,sy))
+                path.reverse()
+                return path
+
+            for nx, ny, step_len in self._neighbors8(x,y):
+                base = g[(x,y)] + step_len
+                c = self._cell_cost(km[nx,ny])
+                if c == float("inf"): 
+                    continue
+                cand = base + c
+                if cand < g.get((nx,ny), float("inf")):
+                    g[(nx,ny)] = cand
+                    parent[(nx,ny)] = (x,y)
+                    f = cand + h(nx,ny)
+                    heapq.heappush(pq, (f, rid, (nx,ny))); rid += 1
+        return None
+
+# ---- A* planner on (x,y,vx,vy) with anti-oscillation costs (kept as fallback) ----
 
 class AStarPlanner:
     def __init__(self, world: WorldModel, vMax: int, rSafe: int, maxNodes: int = 20000):
@@ -389,9 +408,9 @@ class AStarPlanner:
                     turnp = self._turnPenalty(vx,vy,nvx,nvy)
 
                     # --- Anti-oscillation extras ---
-                    backtrack_pen = self.w_backtrack if (nx == prev_x and ny == prev_y) else 0.0
-                    edge_rep_pen = self.w_edge_repeat * float(self.world.edge_count(x, y, nx, ny))
-                    visit_pen = self.w_visit * float(self.world.visited_count[nx, ny])
+                    backtrack_pen =  self.w_backtrack if (nx == prev_x and ny == prev_y) else 0.0
+                    edge_rep_pen =  self.w_edge_repeat * float(self.world.edge_count(x, y, nx, ny))
+                    visit_pen    =  self.w_visit * float(self.world.visited_count[nx, ny])
 
                     stepCost = base + turnp + backtrack_pen + edge_rep_pen + visit_pen
 
@@ -405,46 +424,20 @@ class AStarPlanner:
                         counter += 1
         return None
 
-# ---- DFS-first Target selection ----
+# ---- Target selection ----
 
-def chooseTargetDFS(world: WorldModel, agentXY: Tuple[int,int]) -> Tuple[str, Optional[Tuple[int,int]]]:
-    """
-    DFS policy on the grid graph (known traversable cells).
-    - Extend along an unexpanded neighbor (frontier-biased) if any.
-    - Else backtrack to nearest junction with remaining branches.
-    - Else None.
-    """
+def chooseTarget(world: WorldModel, agentXY: Tuple[int,int]) -> Tuple[str, Optional[Tuple[int,int]], Optional[List[Tuple[int,int]]]]:
     km = world.known_map
-
-    # 1) If GOAL is known anywhere, let higher layer handle it outside.
-    # (We check goals outside this function.)
-
-    # 2) Maintain stack with current position context.
-    world.update_dfs_stack_at(agentXY)
-
-    x, y = agentXY
-    if not (0 <= x < km.shape[0] and 0 <= y < km.shape[1]) or not world._trav(km[x,y]):
-        return "idle", None
-
-    # 3) Try to extend DFS from current cell: prefer unexpanded edges.
-    neighbors = world.traversable_neighbors(x, y)
-
-    # Partition neighbors by frontier bias first
-    unexpanded = [(nx, ny) for (nx, ny) in neighbors if not world.dfs_edge_expanded(x, y, nx, ny)]
-    if unexpanded:
-        frontier_first = [(nx, ny) for (nx, ny) in unexpanded if world.is_frontier_cell(nx, ny)]
-        pool = frontier_first if frontier_first else unexpanded
-        # Choose least visited to reduce loops
-        pool.sort(key=lambda p: (world.visited_count[p[0], p[1]]))
-        return "dfs_extend", pool[0]
-
-    # 4) No local unexpanded edges -> backtrack to nearest junction with remaining branches
-    world.prune_dfs_stack()
-    if world.dfs_stack:
-        return "dfs_backtrack", world.dfs_stack[-1]
-
-    # 5) No DFS target -> None (let caller try BFS frontier or fallback)
-    return "idle", None
+    goals = np.argwhere(km == CellType.GOAL.value)
+    if goals.size > 0:
+        sx, sy = agentXY
+        dists = [ (abs(int(x)-sx)+abs(int(y)-sy), (int(x),int(y))) for (x,y) in goals ]
+        dists.sort()
+        return "goal", dists[0][1], None
+    path = world.nearestFrontierFrom(agentXY)
+    if path:
+        return "explore", path[-1], path
+    return "idle", None, None
 
 # ---- Local fallback (visibility-safe + forward/novelty bias) ----
 
@@ -507,10 +500,166 @@ def fallbackMoveWithBrakeAndBias(state: State, world: WorldModel, rSafe: int) ->
     best_axay = pool[0][0]
     return best_axay
 
+# ---- NEW: Pure-Pursuit Waypoint driver (fast default) ----
+
+def _furthest_visible_on_path(world: WorldModel, start_xy: Tuple[int,int], path: List[Tuple[int,int]], max_jump: int = 30) -> Tuple[int, Tuple[int,int]]:
+    """
+    Return (index, cell) of the furthest path point with line-of-sight from start_xy
+    on the known map. Limited by max_jump to keep things local & safe.
+    """
+    if not path:
+        return 0, start_xy
+    p0 = np.array(start_xy, dtype=int)
+    last_idx = 0
+    last_cell = path[0]
+    # sample up to max_jump ahead
+    upto = min(len(path)-1, max_jump)
+    for i in range(1, upto+1):
+        c = path[i]
+        if validLineOnMap(world, p0, np.array(c, dtype=int)):
+            last_idx = i
+            last_cell = c
+        else:
+            break
+    return last_idx, last_cell
+
+def _path_curvature(path: List[Tuple[int,int]], i: int) -> float:
+    """
+    Rough curvature at index i using angle between segments. 0 = straight, 1 = sharp.
+    """
+    if i <= 0 or i >= len(path)-1:
+        return 0.0
+    p0 = np.array(path[i-1]); p1 = np.array(path[i]); p2 = np.array(path[i+1])
+    v1 = p1 - p0; v2 = p2 - p1
+    n1 = np.linalg.norm(v1); n2 = np.linalg.norm(v2)
+    if n1 == 0 or n2 == 0: return 0.0
+    cos = np.clip(float(np.dot(v1, v2) / (n1*n2)), -1.0, 1.0)
+    ang = math.acos(cos)  # [0..pi]
+    return min(1.0, ang / math.pi)
+
+def _target_speed_from_context(distance_left: float, curvature: float, rSafe: int) -> float:
+    """
+    Pick a target |v'|. Go faster on straights and when far; slow down near bends or close to goal.
+    Upper bounded by braking distance rSafe (per-axis triangular bound is handled separately).
+    """
+    base = 3.5 if curvature < 0.15 else (2.5 if curvature < 0.4 else 1.5)
+    far_boost = 2.0 if distance_left > 15 else (1.0 if distance_left > 8 else 0.0)
+    tgt = base + far_boost
+    # Soft cap by rSafe: triangular per-axis, but use scalar heuristic ~ sqrt(2*rSafe)
+    cap = max(1.0, math.sqrt(2*max(0, rSafe)))
+    return float(min(tgt, cap + 1.0))
+
+def _score_accel(ax: int, ay: int,
+                 state: State, world: WorldModel, rSafe: int,
+                 waypoint: Tuple[int,int], target_speed: float) -> Optional[Tuple[float, Tuple[int,int]]]:
+    """
+    Score a single acceleration choice. Returns (score, next_xy) or None if illegal.
+    Lower score is better.
+    """
+    assert state.agent is not None
+    p = state.agent.pos
+    v = state.agent.vel
+    vx, vy = int(v[0]), int(v[1])
+    nvx, nvy = vx + ax, vy + ay
+    # braking invariant
+    if not brakingOk(nvx, nvy, rSafe):
+        return None
+
+    next_pos = p + v + np.array([ax, ay], dtype=int)
+    nx, ny = int(next_pos[0]), int(next_pos[1])
+
+    # local visibility safety
+    if not validLineLocal(state, p, next_pos):
+        return None
+
+    # avoid stepping on another player
+    if any(np.array_equal(next_pos, q.pos) for q in state.players):
+        return None
+
+    # core terms
+    wp = np.array(waypoint, dtype=float)
+    dist_to_wp = float(np.linalg.norm(wp - next_pos))
+    speed_next = float(math.hypot(nvx, nvy))
+    speed_pen = abs(speed_next - target_speed)
+
+    # heading (prefer pointing velocity toward waypoint)
+    heading_pen = 0.0
+    if speed_next > 0.0:
+        to_wp = wp - next_pos
+        n_to = float(np.linalg.norm(to_wp))
+        if n_to > 0:
+            cos = float((nvx*to_wp[0] + nvy*to_wp[1]) / (speed_next * n_to))
+            heading_pen = (1.0 - cos) * 0.6  # small
+
+    # anti-oscillation (reuse your stats)
+    node_pen = 0.04 * float(world.visited_count[nx, ny])
+    edge_pen = 0.5 * float(world.edge_count(int(p[0]), int(p[1]), nx, ny))
+
+    # gentle bias to keep moving (small cost if killing speed)
+    stop_bias = 0.2 if speed_next == 0.0 else 0.0
+
+    score = (2.0 * dist_to_wp) + (0.8 * speed_pen) + heading_pen + node_pen + edge_pen + stop_bias
+    return score, (nx, ny)
+
+def pure_pursuit_move(state: State, world: WorldModel,
+                      coarse: CoarsePlanner2D,
+                      rSafe: int) -> Optional[Tuple[int,int]]:
+    """
+    Default fast driver. Returns an acceleration (ax, ay) or None if it cannot find one.
+    """
+    assert state.agent is not None
+    agent_xy = (int(state.agent.x), int(state.agent.y))
+    km = world.known_map
+
+    # pick goal (or closest GOAL cell)
+    goals = np.argwhere(km == CellType.GOAL.value)
+    target = None
+    if goals.size > 0:
+        # nearest goal by manhattan
+        dists = [ (abs(int(x)-agent_xy[0]) + abs(int(y)-agent_xy[1]), (int(x),int(y))) for (x,y) in goals ]
+        dists.sort()
+        target = dists[0][1]
+    else:
+        # bias toward frontier center if no goal known
+        fpath = world.nearestFrontierFrom(agent_xy)
+        if fpath and len(fpath) >= 1:
+            target = fpath[-1]
+        else:
+            return None  # nothing meaningful to chase
+
+    # fast 2D path
+    path = coarse.plan_path(agent_xy, target)
+    if not path or len(path) <= 1:
+        return None
+
+    # choose furthest visible waypoint; add small lookahead beyond that if possible
+    far_idx, wp = _furthest_visible_on_path(world, agent_xy, path, max_jump=40)
+
+    # estimate curvature around waypoint and distance left along the path
+    curv = _path_curvature(path, max(1, min(far_idx, len(path)-2)))
+    dist_left = float(len(path) - far_idx)
+    target_speed = _target_speed_from_context(dist_left, curv, rSafe)
+
+    # try all 9 accelerations
+    best = None
+    best_axay = (0, 0)
+    for ax in (-1, 0, 1):
+        for ay in (-1, 0, 1):
+            scored = _score_accel(ax, ay, state, world, rSafe, wp, target_speed)
+            if scored is None:
+                continue
+            sc, _nxny = scored
+            if (best is None) or (sc < best):
+                best = sc
+                best_axay = (ax, ay)
+
+    return best_axay if best is not None else None
+
 # ---- Decision (receding horizon) ----
 
 def calculateMove(world: WorldModel, planner: AStarPlanner,
-                  rng: np.random.Generator, state: State) -> Tuple[int,int]:
+                  rng: np.random.Generator, state: State,
+                  coarse: CoarsePlanner2D) -> Tuple[int,int]:
     assert state.agent is not None
     assert state.visible_raw is not None
 
@@ -523,45 +672,23 @@ def calculateMove(world: WorldModel, planner: AStarPlanner,
     agentXY = (int(state.agent.x), int(state.agent.y))
     agentV  = (int(state.agent.vel_x), int(state.agent.vel_y))
 
-    # --- Priority 1: if any GOAL is known, go for it
-    km = world.known_map
-    goals = np.argwhere(km == CellType.GOAL.value)
-    if goals.size > 0:
-        sx, sy = agentXY
-        dists = [ (abs(int(x)-sx)+abs(int(y)-sy), (int(x),int(y))) for (x,y) in goals ]
-        dists.sort()
-        target = dists[0][1]
-        actions = planner.plan(agentXY, agentV, target)
-        if actions:
-            ax, ay = actions[0]
-        else:
-            ax, ay = fallbackMoveWithBrakeAndBias(state, world, rSafe)
-    else:
-        # --- DFS-first target selection
-        mode, target = chooseTargetDFS(world, agentXY)
-
-        if target is None or mode == "idle":
-            # Try BFS to nearest frontier as a graceful fallback
-            path = world.nearestFrontierFrom(agentXY)
-            if path and len(path) > 0:
-                target = path[-1]
-                actions = planner.plan(agentXY, agentV, target)
-                if actions:
-                    ax, ay = actions[0]
-                else:
-                    ax, ay = fallbackMoveWithBrakeAndBias(state, world, rSafe)
-            else:
-                ax, ay = fallbackMoveWithBrakeAndBias(state, world, rSafe)
-        else:
-            # Plan to DFS target (neighbor or backtrack junction)
+    # --- NEW default: fast pure-pursuit on coarse path
+    fast_axay = pure_pursuit_move(state, world, coarse, rSafe)
+    if fast_axay is None:
+        # Keep your old target selection + 4D planner as a fallback
+        mode, target, _ = chooseTarget(world, agentXY)
+        if target is not None:
             actions = planner.plan(agentXY, agentV, target)
             if actions:
                 ax, ay = actions[0]
             else:
-                # If planner fails, try safe local move
                 ax, ay = fallbackMoveWithBrakeAndBias(state, world, rSafe)
+        else:
+            ax, ay = fallbackMoveWithBrakeAndBias(state, world, rSafe)
+    else:
+        ax, ay = fast_axay
 
-    # avoid stepping onto another player's cell
+    # avoid stepping onto another player's cell (final guard)
     nextPos = state.agent.pos + state.agent.vel + np.array([ax, ay])
     if any(np.all(nextPos == p.pos) for p in state.players):
         ax, ay = 0, 0
@@ -571,9 +698,6 @@ def calculateMove(world: WorldModel, planner: AStarPlanner,
     world.visited_count[agentXY[0], agentXY[1]] += 1
     nx, ny = int(nextPos[0]), int(nextPos[1])
     world.touch_edge(agentXY[0], agentXY[1], nx, ny)
-
-    # --- Record DFS traversal on the actual directed edge we took this turn
-    world.record_dfs_traverse(agentXY[0], agentXY[1], nx, ny)
 
     return ax, ay
 
@@ -591,7 +715,8 @@ def main():
     SAFETY_MARGIN = 1
     rSafe = max(0, R - SAFETY_MARGIN)
 
-    planner = AStarPlanner(world, vMax=7, rSafe=rSafe, maxNodes=30000)
+    planner = AStarPlanner(world, vMax=7, rSafe=rSafe, maxNodes=25000)
+    coarse = CoarsePlanner2D(world)
     rng = np.random.default_rng(seed=1)
 
     while True:
@@ -599,7 +724,7 @@ def main():
         state = read_observation(state)
         if state is None:
             return
-        ax, ay = calculateMove(world, planner, rng, state)
+        ax, ay = calculateMove(world, planner, rng, state, coarse)
         # clamp to {-1,0,1} for the judge delta
         ax = -1 if ax < -1 else (1 if ax > 1 else int(ax))
         ay = -1 if ay < -1 else (1 if ay > 1 else int(ay))
