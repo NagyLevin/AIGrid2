@@ -1,6 +1,6 @@
 {
   "track_file": "maps/antihill_wide.png",
   "max_turns": 500,
-  "visibility_radius": 7
+  "visibility_radius": 8
 }
 

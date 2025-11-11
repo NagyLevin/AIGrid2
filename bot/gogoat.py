@@ -1,9 +1,8 @@
 import sys
 import enum
 import numpy as np
-import collections  # NEW: We need a deque for the BFS
-
-from typing import Optional, NamedTuple
+import collections
+from typing import Optional, NamedTuple, List, Tuple, Dict, Set
 
 # --- Enums and Data Structures (Unchanged) ---
 
@@ -13,6 +12,7 @@ class CellType(enum.Enum):
     EMPTY = 0
     START = 1
     GOAL = 100
+    UNKNOWN = -2 
 
 class Player(NamedTuple):
     x: int
@@ -33,15 +33,81 @@ class Circuit(NamedTuple):
     num_players: int
     visibility_radius: int
 
+# --- WorldModel (Simplified) ---
+# We only need the map and traversability checks.
+# All complex state (penalties, etc.) is gone.
+
+class WorldModel:
+    def __init__(self, shape: tuple[int, int]):
+        self.shape = shape
+        self.global_map = np.full(shape, CellType.UNKNOWN.value, dtype=int)
+        
+    def update_map(self, posx: int, posy: int, R: int, lines: List[str]):
+        for i, line_str in enumerate(lines):
+            line_cells = [int(a) for a in line_str.split()]
+            map_x = posx - R + i
+            if not (0 <= map_x < self.shape[0]):
+                continue
+
+            for j, cell_val in enumerate(line_cells):
+                map_y = posy - R + j
+                if not (0 <= map_y < self.shape[1]):
+                    continue
+
+                if cell_val != CellType.NOT_VISIBLE.value:
+                    self.global_map[map_x, map_y] = cell_val
+
+    def is_traversable(self, x: int, y: int) -> bool:
+        if not (0 <= x < self.shape[0] and 0 <= y < self.shape[1]):
+            return False
+        val = self.global_map[x, y]
+        return (val == CellType.EMPTY.value or
+                val == CellType.START.value or
+                val == CellType.GOAL.value)
+
+    def get_neighbors(self, x: int, y: int) -> List[Tuple[int, int]]:
+        """Gets 4-directional traversable neighbors for 2D BFS."""
+        neighbors = []
+        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            nx, ny = x + dx, y + dy
+            if self.is_traversable(nx, ny):
+                neighbors.append((nx, ny))
+        return neighbors
+
+    def find_targets(self, agent_xy: Tuple[int, int]) -> np.ndarray:
+        """Finds all goals, or if none, all unknown cells."""
+        goals = np.argwhere(self.global_map == CellType.GOAL.value)
+        if goals.size > 0:
+            return goals
+            
+        # No goals, find all frontiers (traversable cells next to unknown)
+        frontiers = []
+        traversable_cells = np.argwhere(
+            (self.global_map == CellType.EMPTY.value) |
+            (self.global_map == CellType.START.value)
+        )
+        
+        for x, y in traversable_cells:
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = x + dx, y + dy
+                if (0 <= nx < self.shape[0] and 0 <= ny < self.shape[1] and
+                        self.global_map[nx, ny] == CellType.UNKNOWN.value):
+                    frontiers.append((x, y))
+                    break 
+                    
+        if frontiers:
+            return np.array(frontiers)
+        
+        return np.array([]) 
+
+# --- State Tuple (Unchanged) ---
 class State(NamedTuple):
     circuit: Circuit
-    global_map: np.ndarray  # Our persistent memory
+    world: WorldModel
     players: list[Player]
     agent: Player
 
-# --- Map/Observation Reading (Unchanged) ---
-# This part works well and is necessary for memory.
-
+# --- I/O Functions (Unchanged) ---
 def read_initial_observation() -> Circuit:
     H, W, num_players, visibility_radius = map(int, input().split())
     return Circuit((H, W), num_players, visibility_radius)
@@ -59,57 +125,31 @@ def read_observation(old_state: State) -> Optional[State]:
         pposx, pposy = map(int, input().split())
         players.append(Player(pposx, pposy, 0, 0))
 
-    new_global_map = old_state.global_map.copy()
     R = circuit_data.visibility_radius
+    lines = [input() for _ in range(2 * R + 1)]
     
-    for i in range(2 * R + 1):
-        line_cells = [int(a) for a in input().split()]
-        map_x = posx - R + i
-        if not (0 <= map_x < circuit_data.track_shape[0]):
-            continue
+    old_state.world.update_map(posx, posy, R, lines)
 
-        for j, cell_val in enumerate(line_cells):
-            map_y = posy - R + j
-            if not (0 <= map_y < circuit_data.track_shape[1]):
-                continue
+    return old_state._replace(players=players, agent=agent)
 
-            if cell_val != CellType.NOT_VISIBLE.value:
-                new_global_map[map_x, map_y] = cell_val
-
-    return old_state._replace(
-        global_map=new_global_map, players=players, agent=agent)
-
-# --- Validity Checks (with CRASH FIX) ---
-
-def traversable(cell_value: int) -> bool:
-    # We can only move on known, open spaces
-    return (cell_value == CellType.EMPTY.value or
-            cell_value == CellType.START.value or
-            cell_value == CellType.GOAL.value)
-
-def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
-    """
-    This is the line-of-sight check, now with boundary checks
-    inside the loops to prevent crashes.
-    """
-    track = state.global_map
+# --- valid_line Function (Unchanged) ---
+def valid_line(world: WorldModel, pos1: np.ndarray, pos2: np.ndarray) -> bool:
+    track = world.global_map
+    shape = world.shape
     
-    # Check start and end bounds
     if (np.any(pos1 < 0) or np.any(pos2 < 0) or 
-        np.any(pos1 >= track.shape) or np.any(pos2 >= track.shape)):
+        np.any(pos1 >= shape) or np.any(pos2 >= shape)):
         return False
 
-    # Check landing spot traversability
     try:
         p2_int = pos2.astype(int)
-        if not traversable(track[p2_int[0], p2_int[1]]):
+        if not world.is_traversable(p2_int[0], p2_int[1]):
             return False
     except IndexError:
-        return False # Landed out of bounds
+        return False
 
     diff = pos2 - pos1
     
-    # Check vertical/diagonal walls
     if diff[0] != 0:
         slope = diff[1] / diff[0]
         d = np.sign(diff[0])
@@ -119,18 +159,11 @@ def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
             y_ceil = np.ceil(y).astype(int)
             y_floor = np.floor(y).astype(int)
             
-            # --- CRASH FIX ---
-            if not (0 <= x < track.shape[0] and
-                    0 <= y_ceil < track.shape[1] and
-                    0 <= y_floor < track.shape[1]):
+            if not (0 <= x < shape[0] and 0 <= y_ceil < shape[1] and 0 <= y_floor < shape[1]):
                 return False
-            # --- END FIX ---
-            
-            if (not traversable(track[x, y_ceil])
-                    and not traversable(track[x, y_floor])):
+            if (not world.is_traversable(x, y_ceil) and not world.is_traversable(x, y_floor)):
                 return False
 
-    # Check horizontal/diagonal walls
     if diff[1] != 0:
         slope = diff[0] / diff[1]
         d = np.sign(diff[1])
@@ -140,129 +173,113 @@ def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
             x_ceil = np.ceil(x).astype(int)
             x_floor = np.floor(x).astype(int)
 
-            # --- CRASH FIX ---
-            if not (0 <= y < track.shape[1] and
-                    0 <= x_ceil < track.shape[0] and
-                    0 <= x_floor < track.shape[0]):
+            if not (0 <= y < shape[1] and 0 <= x_ceil < shape[0] and 0 <= x_floor < shape[0]):
                 return False
-            # --- END FIX ---
-
-            if (not traversable(track[x_ceil, y])
-                    and not traversable(track[x_floor, y])):
+            if (not world.is_traversable(x_ceil, y) and not world.is_traversable(x_floor, y)):
                 return False
     return True
 
-# --- NEW: BFS Pathfinding Map ---
+# --- **** NEW: 2D BFS Pathfinding **** ---
 
-def create_distance_map(global_map: np.ndarray, targets: np.ndarray) -> np.ndarray:
+def find_path_bfs_2d(world: WorldModel, start: Tuple[int, int],
+                     targets: np.ndarray) -> Optional[List[Tuple[int, int]]]:
     """
-    Creates a map where each cell's value is the
-    grid-distance to the nearest target.
+    Finds a 2D grid path to the nearest target.
+    This is fast and runs every turn.
     """
-    distance_map = np.full(global_map.shape, np.inf)
-    queue = collections.deque()
-    
-    # Add all targets to the queue with distance 0
-    for x, y in targets:
-        if traversable(global_map[x, y]):
-            distance_map[x, y] = 0
-            queue.append((x, y))
+    if not world.is_traversable(start[0], start[1]):
+        # We are on a non-traversable tile? Try to find a neighbor
+        for nx, ny in world.get_neighbors(start[0], start[1]):
+             start = (nx, ny) # Start from the first valid neighbor
+             break
+        else:
+             return None # Truly trapped
 
-    # 8-directional neighbors
-    neighbors = [(dx, dy) for dx in [-1, 0, 1] for dy in [-1, 0, 1] if (dx, dy) != (0, 0)]
-
-    while queue:
-        x, y = queue.popleft()
-        current_dist = distance_map[x, y]
+    target_set = set(map(tuple, targets))
+    if not target_set:
+        return None
         
-        for dx, dy in neighbors:
-            nx, ny = x + dx, y + dy
-            
-            # Check bounds
-            if not (0 <= nx < global_map.shape[0] and 0 <= ny < global_map.shape[1]):
-                continue
-                
-            # If the neighbor is traversable AND we found a shorter path
-            if traversable(global_map[nx, ny]) and distance_map[nx, ny] == np.inf:
-                distance_map[nx, ny] = current_dist + 1
-                queue.append((nx, ny))
-                
-    return distance_map
-
-# --- NEW: "Path-Guided Greedy" Agent Logic ---
-
-def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
+    q = collections.deque([(start[0], start[1])])
+    parent: Dict[Tuple[int, int], Optional[Tuple[int, int]]] = {start: None}
     
-    self_pos = state.agent.pos
-    self_vel = state.agent.vel
+    while q:
+        x, y = q.popleft()
+        
+        if (x, y) in target_set:
+            path = []
+            curr = (x, y)
+            while curr is not None:
+                path.append(curr)
+                curr = parent[curr]
+            return path[::-1] # Return from start to goal
 
-    # 1. Find Targets
-    targets = np.argwhere(state.global_map == CellType.GOAL.value)
+        for nx, ny in world.get_neighbors(x, y):
+            if (nx, ny) not in parent:
+                parent[(nx, ny)] = (x, y)
+                q.append((nx, ny))
+                
+    return None 
+
+# --- **** NEW: calculate_move Function **** ---
+
+def calculate_move(state: State) -> tuple[int, int]:
+    
+    world = state.world
+    agent = state.agent
+    agent_xy = (agent.x, agent.y)
+    
+    # --- 1. Find all possible targets ---
+    targets = world.find_targets(agent_xy)
     
     if targets.size == 0:
-        # No goals visible, switch to explore mode
-        targets = np.argwhere(state.global_map == CellType.NOT_VISIBLE.value)
-
-    if targets.size == 0:
-        # No goals AND no unknown cells. We're done or trapped.
         print("No targets found. Braking.", file=sys.stderr)
+        return (0, 0) # No goals, no frontiers. We're done.
+
+    # --- 2. Run the fast 2D BFS to get a path ---
+    path = find_path_bfs_2d(world, agent_xy, targets)
+
+    if path is None or len(path) < 2:
+        # No path found, or we are on the target.
+        # This can happen if we are trapped.
+        print("No 2D path found. Braking.", file=sys.stderr)
         return (0, 0)
         
-    # 2. NEW: Create the BFS distance map
-    distance_map = create_distance_map(state.global_map, targets)
+    # --- 3. Find our "target" cell ---
+    # Our target is the *next step* on the path.
+    # We use a point a few steps ahead for a smoother ride.
+    waypoint_idx = min(len(path) - 1, 3) # Aim 3 steps ahead
+    target_cell = np.array(path[waypoint_idx])
 
-    # 3. Score all 9 possible moves
-    best_score = float('inf')
+    # --- 4. Check all 9 moves ---
+    best_dist = float('inf')
     best_move = (0, 0) # Default to braking
-    best_vel_norm = float('inf')
+    
+    player_positions = {tuple(p.pos) for p in state.players}
 
     for ax in range(-1, 2):
         for ay in range(-1, 2):
             accel = np.array([ax, ay])
-            next_vel = self_vel + accel
-            next_pos = self_pos + next_vel
-            
-            # Check for validity (THIS IS THE CRITICAL PART)
-            is_valid = False
-            try:
-                # Use the fixed, robust valid_line check
-                if valid_line(state, self_pos, next_pos):
-                    # Check player collisions
-                    if not any(np.all(next_pos.astype(int) == p.pos) for p in state.players):
-                        is_valid = True
-            except Exception as e:
-                # Catch any unexpected crash
-                print(f"Error checking move: {e}", file=sys.stderr)
-                is_valid = False
-            
-            if is_valid:
-                # This is a valid move. Score it.
-                # NEW SCORE: Look up the distance from our BFS map
-                next_pos_int = next_pos.astype(int)
-                score = distance_map[next_pos_int[0], next_pos_int[1]]
-                
-                vel_norm = np.linalg.norm(next_vel)
-                
-                if score < best_score:
-                    # This is the new best move
-                    best_score = score
-                    best_move = (ax, ay)
-                    best_vel_norm = vel_norm
-                elif score == best_score:
-                    # Tie-breaker: prefer lower speed
-                    if vel_norm < best_vel_norm:
-                        best_score = score
-                        best_move = (ax, ay)
-                        best_vel_norm = vel_norm
-            else:
-                # Invalid moves get a score of infinity
-                pass
+            next_vel = agent.vel + accel
+            next_pos = agent.pos + next_vel
 
-    if best_score == float('inf'):
-        # All 9 moves were invalid, or led to un-pathable areas.
-        print("All moves are invalid or lead to infinity! Braking.", file=sys.stderr)
+            if not valid_line(world, agent.pos, next_pos):
+                continue
+                
+            if tuple(next_pos.astype(int)) in player_positions:
+                continue
+                
+            # This is a valid move. Score it.
+            # Score is just the distance to the target cell.
+            dist_to_target = np.linalg.norm(next_pos - target_cell)
+            
+            if dist_to_target < best_dist:
+                best_dist = dist_to_target
+                best_move = (ax, ay)
+                
+    if best_dist == float('inf'):
+        # All 9 moves were invalid. We are truly trapped.
         return (0, 0)
-
+        
     return best_move
 
 
@@ -270,13 +287,9 @@ def main():
     print('READY', flush=True)
     circuit = read_initial_observation()
     
-    # Initialize the persistent global_map
-    global_map = np.full(circuit.track_shape, CellType.NOT_VISIBLE.value)
+    world = WorldModel(circuit.track_shape)
     
-    state: Optional[State] = State(circuit, global_map, [], None)  # type: ignore
-    
-    # RNG is not used in this approach, but we keep the object
-    rng = np.random.default_rng()
+    state: Optional[State] = State(circuit, world, [], None) # type: ignore
     
     while True:
         assert state is not None
@@ -285,7 +298,7 @@ def main():
         if state is None:
             return
             
-        delta = calculate_move(rng, state)
+        delta = calculate_move(state)
         
         print(f'{delta[0]} {delta[1]}', flush=True)
 
