@@ -240,19 +240,20 @@ def tri(n: int) -> int:
 def brakingOk(vx: int, vy: int, rSafe: int) -> bool:
     return (tri(abs(vx)) <= rSafe) and (tri(abs(vy)) <= rSafe)
 
-# ---- NEW: fast 2D coarse planner (positions only) ----
+# ---- Improved coarse planner (positions only) ----
 
 class CoarsePlanner2D:
     """
-    Fast A* over (x,y), diagonals allowed. Unknown cells are allowed but costly,
-    so it eagerly explores toward the goal without getting stuck waiting.
+    Fast A* over (x,y), diagonals allowed. UNKNOWN is allowed but cheap
+    to keep pushing forward through foggy corridors.
     """
     def __init__(self, world: WorldModel):
         self.world = world
-        # costs
-        self.cost_unknown = 5.0  # soft-allow UNKNOWN to push through fog
+        # tuned costs
+        self.cost_unknown = 1.4   # LOWER than before: prefer exploring forwards
         self.cost_empty = 1.0
         self.cost_goal = 1.0
+        self.revisit_w = 0.02     # tiny penalty for revisits
 
     def _neighbors8(self, x: int, y: int):
         for dx, dy in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)):
@@ -260,17 +261,21 @@ class CoarsePlanner2D:
             if 0 <= nx < self.world.shape[0] and 0 <= ny < self.world.shape[1]:
                 yield nx, ny, (1.41421356 if dx and dy else 1.0)
 
-    def _cell_cost(self, v: int) -> float:
+    def _cell_cost(self, x: int, y: int) -> float:
+        v = self.world.known_map[x, y]
         if v == CellType.WALL.value:
             return float("inf")
         if v == CellType.GOAL.value:
-            return self.cost_goal
-        if v == CellType.UNKNOWN.value:
-            return self.cost_unknown
-        # EMPTY/START/etc.
-        return self.cost_empty
+            base = self.cost_goal
+        elif v == CellType.UNKNOWN.value:
+            base = self.cost_unknown
+        else:
+            base = self.cost_empty
+        # gentle "don't go back" bias
+        base += self.revisit_w * float(self.world.visited_count[x, y])
+        return base
 
-    def plan_path(self, start: Tuple[int,int], target: Tuple[int,int]) -> Optional[List[Tuple[int,int]]]:
+    def plan_path(self, start: Tuple[int,int], target: Tuple[int,int]) -> Optional[Tuple[List[Tuple[int,int]], float]]:
         sx, sy = start
         tx, ty = target
         km = self.world.known_map
@@ -282,8 +287,7 @@ class CoarsePlanner2D:
         def h(x: int, y: int) -> float:
             return math.hypot(x-tx, y-ty)
 
-        start_cost = 0.0
-        g: Dict[Tuple[int,int], float] = {(sx,sy): start_cost}
+        g: Dict[Tuple[int,int], float] = {(sx,sy): 0.0}
         parent: Dict[Tuple[int,int], Tuple[int,int]] = {}
         pq: List[Tuple[float, int, Tuple[int,int]]] = []
         rid = 0
@@ -292,7 +296,7 @@ class CoarsePlanner2D:
 
         while pq:
             _, _, (x,y) = heapq.heappop(pq)
-            if (x,y) in seen: 
+            if (x,y) in seen:
                 continue
             seen.add((x,y))
 
@@ -304,14 +308,13 @@ class CoarsePlanner2D:
                     path.append(cur); cur = parent[cur]
                 path.append((sx,sy))
                 path.reverse()
-                return path
+                return path, g[(x,y)]
 
             for nx, ny, step_len in self._neighbors8(x,y):
-                base = g[(x,y)] + step_len
-                c = self._cell_cost(km[nx,ny])
+                c = self._cell_cost(nx, ny)
                 if c == float("inf"): 
                     continue
-                cand = base + c
+                cand = g[(x,y)] + step_len + c
                 if cand < g.get((nx,ny), float("inf")):
                     g[(nx,ny)] = cand
                     parent[(nx,ny)] = (x,y)
@@ -319,7 +322,7 @@ class CoarsePlanner2D:
                     heapq.heappush(pq, (f, rid, (nx,ny))); rid += 1
         return None
 
-# ---- A* planner on (x,y,vx,vy) with anti-oscillation costs (kept as fallback) ----
+# ---- A* planner on (x,y,vx,vy) with anti-oscillation costs (fallback) ----
 
 class AStarPlanner:
     def __init__(self, world: WorldModel, vMax: int, rSafe: int, maxNodes: int = 20000):
@@ -424,19 +427,52 @@ class AStarPlanner:
                         counter += 1
         return None
 
-# ---- Target selection ----
+# ---- Target selection using coarse A* costs ----
 
-def chooseTarget(world: WorldModel, agentXY: Tuple[int,int]) -> Tuple[str, Optional[Tuple[int,int]], Optional[List[Tuple[int,int]]]]:
+def chooseTargetWithCoarse(world: WorldModel,
+                           coarse: CoarsePlanner2D,
+                           start_xy: Tuple[int,int],
+                           vel_xy: Tuple[int,int]) -> Tuple[str, Optional[Tuple[int,int]], Optional[List[Tuple[int,int]]]]:
+    """
+    Rank GOAL cells (if known) and frontier cells by COARSE path cost.
+    Adds a small penalty if a frontier lies "behind" current velocity.
+    """
     km = world.known_map
-    goals = np.argwhere(km == CellType.GOAL.value)
-    if goals.size > 0:
-        sx, sy = agentXY
-        dists = [ (abs(int(x)-sx)+abs(int(y)-sy), (int(x),int(y))) for (x,y) in goals ]
-        dists.sort()
-        return "goal", dists[0][1], None
-    path = world.nearestFrontierFrom(agentXY)
-    if path:
-        return "explore", path[-1], path
+    vx, vy = vel_xy
+    vnorm = math.hypot(vx, vy)
+    # 1) Goals first (choose reachable lowest-cost)
+    goals = [(int(x), int(y)) for (x, y) in np.argwhere(km == CellType.GOAL.value)]
+    best: Tuple[float, Tuple[int,int], List[Tuple[int,int]], str] | None = None
+    if goals:
+        for g in goals:
+            res = coarse.plan_path(start_xy, g)
+            if not res: 
+                continue
+            path, cost = res
+            tag = "goal"
+            if (best is None) or (cost < best[0]):
+                best = (cost, g, path, tag)
+        if best:
+            return best[3], best[1], best[2]
+
+    # 2) No goal known: pick best frontier (cells adjacent to UNKNOWN)
+    frontiers = world.frontierCells()
+    for f in frontiers:
+        res = coarse.plan_path(start_xy, f)
+        if not res:
+            continue
+        path, cost = res
+        # forward bias: penalize frontiers behind current heading
+        if vnorm > 0:
+            dx, dy = (f[0]-start_xy[0], f[1]-start_xy[1])
+            dot = dx*vx + dy*vy
+            if dot < 0:
+                cost += 6.0  # strong penalty if it's behind
+        if (best is None) or (cost < best[0]):
+            best = (cost, f, path, "explore")
+
+    if best:
+        return best[3], best[1], best[2]
     return "idle", None, None
 
 # ---- Local fallback (visibility-safe + forward/novelty bias) ----
@@ -500,19 +536,14 @@ def fallbackMoveWithBrakeAndBias(state: State, world: WorldModel, rSafe: int) ->
     best_axay = pool[0][0]
     return best_axay
 
-# ---- NEW: Pure-Pursuit Waypoint driver (fast default) ----
+# ---- Pure-Pursuit Waypoint driver (uses new target selection) ----
 
-def _furthest_visible_on_path(world: WorldModel, start_xy: Tuple[int,int], path: List[Tuple[int,int]], max_jump: int = 30) -> Tuple[int, Tuple[int,int]]:
-    """
-    Return (index, cell) of the furthest path point with line-of-sight from start_xy
-    on the known map. Limited by max_jump to keep things local & safe.
-    """
+def _furthest_visible_on_path(world: WorldModel, start_xy: Tuple[int,int], path: List[Tuple[int,int]], max_jump: int = 40) -> Tuple[int, Tuple[int,int]]:
     if not path:
         return 0, start_xy
     p0 = np.array(start_xy, dtype=int)
     last_idx = 0
     last_cell = path[0]
-    # sample up to max_jump ahead
     upto = min(len(path)-1, max_jump)
     for i in range(1, upto+1):
         c = path[i]
@@ -524,9 +555,6 @@ def _furthest_visible_on_path(world: WorldModel, start_xy: Tuple[int,int], path:
     return last_idx, last_cell
 
 def _path_curvature(path: List[Tuple[int,int]], i: int) -> float:
-    """
-    Rough curvature at index i using angle between segments. 0 = straight, 1 = sharp.
-    """
     if i <= 0 or i >= len(path)-1:
         return 0.0
     p0 = np.array(path[i-1]); p1 = np.array(path[i]); p2 = np.array(path[i+1])
@@ -534,68 +562,50 @@ def _path_curvature(path: List[Tuple[int,int]], i: int) -> float:
     n1 = np.linalg.norm(v1); n2 = np.linalg.norm(v2)
     if n1 == 0 or n2 == 0: return 0.0
     cos = np.clip(float(np.dot(v1, v2) / (n1*n2)), -1.0, 1.0)
-    ang = math.acos(cos)  # [0..pi]
+    ang = math.acos(cos)
     return min(1.0, ang / math.pi)
 
 def _target_speed_from_context(distance_left: float, curvature: float, rSafe: int) -> float:
-    """
-    Pick a target |v'|. Go faster on straights and when far; slow down near bends or close to goal.
-    Upper bounded by braking distance rSafe (per-axis triangular bound is handled separately).
-    """
     base = 3.5 if curvature < 0.15 else (2.5 if curvature < 0.4 else 1.5)
     far_boost = 2.0 if distance_left > 15 else (1.0 if distance_left > 8 else 0.0)
     tgt = base + far_boost
-    # Soft cap by rSafe: triangular per-axis, but use scalar heuristic ~ sqrt(2*rSafe)
     cap = max(1.0, math.sqrt(2*max(0, rSafe)))
     return float(min(tgt, cap + 1.0))
 
 def _score_accel(ax: int, ay: int,
                  state: State, world: WorldModel, rSafe: int,
                  waypoint: Tuple[int,int], target_speed: float) -> Optional[Tuple[float, Tuple[int,int]]]:
-    """
-    Score a single acceleration choice. Returns (score, next_xy) or None if illegal.
-    Lower score is better.
-    """
     assert state.agent is not None
     p = state.agent.pos
     v = state.agent.vel
     vx, vy = int(v[0]), int(v[1])
     nvx, nvy = vx + ax, vy + ay
-    # braking invariant
     if not brakingOk(nvx, nvy, rSafe):
         return None
 
     next_pos = p + v + np.array([ax, ay], dtype=int)
     nx, ny = int(next_pos[0]), int(next_pos[1])
 
-    # local visibility safety
     if not validLineLocal(state, p, next_pos):
         return None
-
-    # avoid stepping on another player
     if any(np.array_equal(next_pos, q.pos) for q in state.players):
         return None
 
-    # core terms
     wp = np.array(waypoint, dtype=float)
     dist_to_wp = float(np.linalg.norm(wp - next_pos))
     speed_next = float(math.hypot(nvx, nvy))
     speed_pen = abs(speed_next - target_speed)
 
-    # heading (prefer pointing velocity toward waypoint)
     heading_pen = 0.0
     if speed_next > 0.0:
         to_wp = wp - next_pos
         n_to = float(np.linalg.norm(to_wp))
         if n_to > 0:
             cos = float((nvx*to_wp[0] + nvy*to_wp[1]) / (speed_next * n_to))
-            heading_pen = (1.0 - cos) * 0.6  # small
+            heading_pen = (1.0 - cos) * 0.6
 
-    # anti-oscillation (reuse your stats)
     node_pen = 0.04 * float(world.visited_count[nx, ny])
     edge_pen = 0.5 * float(world.edge_count(int(p[0]), int(p[1]), nx, ny))
-
-    # gentle bias to keep moving (small cost if killing speed)
     stop_bias = 0.2 if speed_next == 0.0 else 0.0
 
     score = (2.0 * dist_to_wp) + (0.8 * speed_pen) + heading_pen + node_pen + edge_pen + stop_bias
@@ -604,43 +614,20 @@ def _score_accel(ax: int, ay: int,
 def pure_pursuit_move(state: State, world: WorldModel,
                       coarse: CoarsePlanner2D,
                       rSafe: int) -> Optional[Tuple[int,int]]:
-    """
-    Default fast driver. Returns an acceleration (ax, ay) or None if it cannot find one.
-    """
     assert state.agent is not None
     agent_xy = (int(state.agent.x), int(state.agent.y))
-    km = world.known_map
+    agent_v  = (int(state.agent.vel_x), int(state.agent.vel_y))
 
-    # pick goal (or closest GOAL cell)
-    goals = np.argwhere(km == CellType.GOAL.value)
-    target = None
-    if goals.size > 0:
-        # nearest goal by manhattan
-        dists = [ (abs(int(x)-agent_xy[0]) + abs(int(y)-agent_xy[1]), (int(x),int(y))) for (x,y) in goals ]
-        dists.sort()
-        target = dists[0][1]
-    else:
-        # bias toward frontier center if no goal known
-        fpath = world.nearestFrontierFrom(agent_xy)
-        if fpath and len(fpath) >= 1:
-            target = fpath[-1]
-        else:
-            return None  # nothing meaningful to chase
-
-    # fast 2D path
-    path = coarse.plan_path(agent_xy, target)
-    if not path or len(path) <= 1:
+    mode, target, coarse_path = chooseTargetWithCoarse(world, coarse, agent_xy, agent_v)
+    if target is None or not coarse_path or len(coarse_path) <= 1:
         return None
 
-    # choose furthest visible waypoint; add small lookahead beyond that if possible
-    far_idx, wp = _furthest_visible_on_path(world, agent_xy, path, max_jump=40)
+    far_idx, wp = _furthest_visible_on_path(world, agent_xy, coarse_path, max_jump=40)
 
-    # estimate curvature around waypoint and distance left along the path
-    curv = _path_curvature(path, max(1, min(far_idx, len(path)-2)))
-    dist_left = float(len(path) - far_idx)
+    curv = _path_curvature(coarse_path, max(1, min(far_idx, len(coarse_path)-2)))
+    dist_left = float(len(coarse_path) - far_idx)
     target_speed = _target_speed_from_context(dist_left, curv, rSafe)
 
-    # try all 9 accelerations
     best = None
     best_axay = (0, 0)
     for ax in (-1, 0, 1):
@@ -672,11 +659,11 @@ def calculateMove(world: WorldModel, planner: AStarPlanner,
     agentXY = (int(state.agent.x), int(state.agent.y))
     agentV  = (int(state.agent.vel_x), int(state.agent.vel_y))
 
-    # --- NEW default: fast pure-pursuit on coarse path
+    # Default: fast pure-pursuit on coarse path selected by path cost
     fast_axay = pure_pursuit_move(state, world, coarse, rSafe)
     if fast_axay is None:
-        # Keep your old target selection + 4D planner as a fallback
-        mode, target, _ = chooseTarget(world, agentXY)
+        # Fallback to older logic
+        mode, target, _ = chooseTargetWithCoarse(world, coarse, agentXY, agentV)
         if target is not None:
             actions = planner.plan(agentXY, agentV, target)
             if actions:
@@ -732,3 +719,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+#large1.png 120
+#arrows.png 181
