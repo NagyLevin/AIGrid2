@@ -105,7 +105,7 @@ class WorldModel:
         # Directed edge traversal counts: key = (x,y,nx,ny)
         self.edge_visits: defaultdict[tuple[int,int,int,int], int] = defaultdict(int)
 
-        # --- New anti-backtrack memory -----------------------
+        # --- Anti-backtrack memory
         self.backtrail: deque[Tuple[int,int]] = deque(maxlen=80)  # recent path cells
         self.prev_pos: Optional[Tuple[int,int]] = None
         self.last_dir: np.ndarray = np.array([0, 0], dtype=int)
@@ -114,10 +114,8 @@ class WorldModel:
         self.commit_target: Optional[Tuple[int,int]] = None
         self.commit_ttl: int = 0
         self.stalled_steps: int = 0
-        # How long to keep a commit and how much stall is tolerated
         self._COMMIT_TTL_DEFAULT = 40
         self._STALL_RESET = 8
-        # toggle to block hard backtracking unless forced
         self.no_backtrack_lock: int = 0  # countdown
 
     def updateWithObservation(self, st: State) -> None:
@@ -262,22 +260,16 @@ def tri(n: int) -> int:
 def brakingOk(vx: int, vy: int, rSafe: int) -> bool:
     return (tri(abs(vx)) <= rSafe) and (tri(abs(vy)) <= rSafe)
 
-# ---- NEW: fast 2D coarse planner (positions only) ----
+# ---- Coarse planner (positions only) with tabu backtrail ----
 
 class CoarsePlanner2D:
-    """
-    Fast A* over (x,y), diagonals allowed. Unknown cells are allowed but costly,
-    so it eagerly explores toward the goal without getting stuck waiting.
-    """
     def __init__(self, world: WorldModel):
         self.world = world
-        # base costs
-        self.cost_unknown = 5.0  # soft-allow UNKNOWN to push through fog
+        self.cost_unknown = 5.0
         self.cost_empty = 1.0
         self.cost_goal = 1.0
-        # tabu penalties
-        self.cost_recent_back = 50.0  # strong for recent backtrail
-        self.cost_old_back = 6.0      # mild for older tail
+        self.cost_recent_back = 50.0
+        self.cost_old_back = 6.0
 
     def _neighbors8(self, x: int, y: int):
         for dx, dy in ((1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)):
@@ -288,24 +280,15 @@ class CoarsePlanner2D:
     def _cell_cost(self, v: int, cell: Tuple[int,int]) -> float:
         if v == CellType.WALL.value:
             return float("inf")
-        if v == CellType.GOAL.value:
-            return self.cost_goal
-        if v == CellType.UNKNOWN.value:
-            base = self.cost_unknown
-        else:
-            base = self.cost_empty
+        base = self.cost_goal if v == CellType.GOAL.value else \
+               (self.cost_unknown if v == CellType.UNKNOWN.value else self.cost_empty)
 
-        # tabu backtrail discourages turning around
         if self.world.backtrail:
-            # recent 12 are "very bad", older are "somewhat bad"
             try:
                 idx = len(self.world.backtrail) - 1 - list(self.world.backtrail)[::-1].index(cell)
-                # if found, idx is 0..len-1 (0 oldest)
                 age = len(self.world.backtrail) - 1 - idx
-                if age <= 12:
-                    base += self.cost_recent_back
-                elif age <= 35:
-                    base += self.cost_old_back
+                if age <= 12:   base += self.cost_recent_back
+                elif age <= 35: base += self.cost_old_back
             except ValueError:
                 pass
         return base
@@ -322,8 +305,7 @@ class CoarsePlanner2D:
         def h(x: int, y: int) -> float:
             return math.hypot(x-tx, y-ty)
 
-        start_cost = 0.0
-        g: Dict[Tuple[int,int], float] = {(sx,sy): start_cost}
+        g: Dict[Tuple[int,int], float] = {(sx,sy): 0.0}
         parent: Dict[Tuple[int,int], Tuple[int,int]] = {}
         pq: List[Tuple[float, int, Tuple[int,int]]] = []
         rid = 0
@@ -332,12 +314,11 @@ class CoarsePlanner2D:
 
         while pq:
             _, _, (x,y) = heapq.heappop(pq)
-            if (x,y) in seen: 
+            if (x,y) in seen:
                 continue
             seen.add((x,y))
 
             if (x,y) == (tx,ty) or km[x,y] == CellType.GOAL.value:
-                # reconstruct
                 path = []
                 cur = (x,y)
                 while cur != (sx,sy):
@@ -347,11 +328,10 @@ class CoarsePlanner2D:
                 return path
 
             for nx, ny, step_len in self._neighbors8(x,y):
-                base = g[(x,y)] + step_len
                 c = self._cell_cost(km[nx,ny], (nx,ny))
                 if c == float("inf"): 
                     continue
-                cand = base + c
+                cand = g[(x,y)] + step_len + c
                 if cand < g.get((nx,ny), float("inf")):
                     g[(nx,ny)] = cand
                     parent[(nx,ny)] = (x,y)
@@ -359,7 +339,7 @@ class CoarsePlanner2D:
                     heapq.heappush(pq, (f, rid, (nx,ny))); rid += 1
         return None
 
-# ---- A* planner on (x,y,vx,vy) with anti-oscillation costs (kept as fallback) ----
+# ---- A* planner on (x,y,vx,vy) with anti-oscillation costs (fallback) ----
 
 class AStarPlanner:
     def __init__(self, world: WorldModel, vMax: int, rSafe: int, maxNodes: int = 20000):
@@ -367,14 +347,12 @@ class AStarPlanner:
         self.v_max = vMax
         self.R_safe = max(0, rSafe)
         self.max_nodes = maxNodes
-        # turning penalties
         self.turn_pen_back = 6.0
         self.turn_pen_half = 2.0
         self.turn_pen_ortho = 0.5
-        # anti-oscillation weights
-        self.w_backtrack = 6.0     # stronger
-        self.w_edge_repeat = 0.9   # stronger
-        self.w_visit = 0.15        # stronger
+        self.w_backtrack = 6.0
+        self.w_edge_repeat = 0.9
+        self.w_visit = 0.15
 
     def heuristicSteps(self, pos: Tuple[int,int], target: Tuple[int,int]) -> float:
         dx = pos[0] - target[0]
@@ -427,7 +405,6 @@ class AStarPlanner:
                 actions.reverse()
                 return actions
 
-            # previous cell (exact kinematics identity): p_{t-1} = p_t - v_t
             prev_x, prev_y = (x - vx, y - vy)
 
             for ax in (-1,0,1):
@@ -447,7 +424,6 @@ class AStarPlanner:
                     base = 1.0
                     turnp = self._turnPenalty(vx,vy,nvx,nvy)
 
-                    # --- Anti-oscillation extras ---
                     backtrack_pen =  self.w_backtrack if (nx == prev_x and ny == prev_y) else 0.0
                     edge_rep_pen =  self.w_edge_repeat * float(self.world.edge_count(x, y, nx, ny))
                     visit_pen    =  self.w_visit * float(self.world.visited_count[nx, ny])
@@ -470,14 +446,12 @@ def _choose_committed_target(world: WorldModel, agentXY: Tuple[int,int]) -> Opti
     km = world.known_map
     goals = np.argwhere(km == CellType.GOAL.value)
     if goals.size > 0:
-        # nearest GOAL by manhattan
         dists = [ (abs(int(x)-agentXY[0]) + abs(int(y)-agentXY[1]), (int(x),int(y))) for (x,y) in goals ]
         dists.sort()
         world.commit_target = dists[0][1]
         world.commit_ttl = world._COMMIT_TTL_DEFAULT
         return world.commit_target
 
-    # still exploring; keep the current commitment if valid
     def valid_frontier_cell(c: Tuple[int,int]) -> bool:
         x, y = c
         if not (0 <= x < km.shape[0] and 0 <= y < km.shape[1]): return False
@@ -488,7 +462,6 @@ def _choose_committed_target(world: WorldModel, agentXY: Tuple[int,int]) -> Opti
         world.commit_ttl -= 1
         return world.commit_target
 
-    # choose a new frontier with heading bias (prefer forward)
     fpath = world.nearestFrontierFrom(agentXY)
     if not fpath:
         world.commit_target = None
@@ -496,12 +469,10 @@ def _choose_committed_target(world: WorldModel, agentXY: Tuple[int,int]) -> Opti
         return None
 
     frontier = fpath[-1]
-    # If we have multiple frontier candidates, pick the one that roughly aligns with last_dir
     candidates = world.frontierCells()
     if candidates:
         vdir = world.last_dir.astype(float)
         def score(c):
-            # distance + small penalty for turning back
             dist = abs(c[0]-agentXY[0]) + abs(c[1]-agentXY[1])
             if np.all(vdir == 0):
                 turn = 0.0
@@ -510,7 +481,6 @@ def _choose_committed_target(world: WorldModel, agentXY: Tuple[int,int]) -> Opti
                 n_to = np.linalg.norm(to) or 1.0
                 cos = float(np.dot(vdir, to) / (np.linalg.norm(vdir) * n_to))
                 turn = (1.0 - cos) * 4.0  # prefer forward
-            # tabu: avoid very recent backtrail
             tabu = 20.0 if c in world.backtrail else 0.0
             return dist + turn + tabu
         candidates.sort(key=score)
@@ -543,7 +513,6 @@ def fallbackMoveWithBrakeAndBias(state: State, world: WorldModel, rSafe: int) ->
             if not validLineLocal(state, selfPos, nextMove):
                 continue
 
-            # base rank and forward bias
             a = math.hypot(vx, vy); b = math.hypot(nvx, nvy)
             rank = 1.0
             if a > 0 and b > 0:
@@ -556,28 +525,24 @@ def fallbackMoveWithBrakeAndBias(state: State, world: WorldModel, rSafe: int) ->
             elif b == 0:
                 rank += 0.3
 
-            # --- Anti-oscillation extras (local) ---
             if nx == int(last_pos[0]) and ny == int(last_pos[1]):
-                rank += 5.0  # harder avoid immediate backtrack unless necessary
+                rank += 5.0  # avoid immediate backtrack unless necessary
 
             rank += 0.9 * float(world.edge_count(int(selfPos[0]), int(selfPos[1]), nx, ny))
             rank += 0.18 * float(world.visited_count[nx, ny])
 
-            # small bonus if stepping next to UNKNOWN (progress)
             if world.has_unknown_neighbor(nx, ny):
                 rank -= 0.6
 
             candidates.append(((ax, ay), rank, (nx, ny)))
 
     if not candidates:
-        # gentle brake towards zero velocity
         ax = -1 if vx > 0 else (1 if vx < 0 else 0)
         ay = -1 if vy > 0 else (1 if vy < 0 else 0)
         if brakingOk(vx+ax, vy+ay, rSafe):
             return (ax, ay)
         return (0, 0)
 
-    # Prefer those that are not immediate backtracks when possible
     non_back = [c for c in candidates if c[2] != (int(last_pos[0]), int(last_pos[1]))]
     pool = non_back if non_back else candidates
 
@@ -585,13 +550,9 @@ def fallbackMoveWithBrakeAndBias(state: State, world: WorldModel, rSafe: int) ->
     best_axay = pool[0][0]
     return best_axay
 
-# ---- NEW: Pure-Pursuit Waypoint driver (fast default) ----
+# ---- Pure-Pursuit Waypoint driver (fast default) ----
 
 def _furthest_visible_on_path(world: WorldModel, start_xy: Tuple[int,int], path: List[Tuple[int,int]], max_jump: int = 40) -> Tuple[int, Tuple[int,int]]:
-    """
-    Return (index, cell) of the furthest path point with line-of-sight from start_xy
-    on the known map. Limited by max_jump to keep things local & safe.
-    """
     if not path:
         return 0, start_xy
     p0 = np.array(start_xy, dtype=int)
@@ -619,19 +580,20 @@ def _path_curvature(path: List[Tuple[int,int]], i: int) -> float:
     return min(1.0, ang / math.pi)
 
 def _target_speed_from_context(distance_left: float, curvature: float, rSafe: int) -> float:
+    """
+    Pick a target |v'|. Go faster on straights and when far; slow down near bends or close to goal.
+    HARD CHANGE HERE: cap from vision radius is HALVED.
+    """
     base = 3.5 if curvature < 0.15 else (2.5 if curvature < 0.4 else 1.5)
     far_boost = 2.0 if distance_left > 15 else (1.0 if distance_left > 8 else 0.0)
     tgt = base + far_boost
-    cap = max(1.0, math.sqrt(2*max(0, rSafe)))
-    return float(min(tgt, cap + 1.0))
+    # Half of the old cap derived from rSafe (vision radius).
+    cap = max(1.0, 0.5 * math.sqrt(2 * max(0, rSafe)))
+    return float(min(tgt, cap))
 
 def _score_accel(ax: int, ay: int,
                  state: State, world: WorldModel, rSafe: int,
                  waypoint: Tuple[int,int], target_speed: float) -> Optional[Tuple[float, Tuple[int,int]]]:
-    """
-    Score a single acceleration choice. Returns (score, next_xy) or None if illegal.
-    Lower score is better.
-    """
     assert state.agent is not None
     p = state.agent.pos
     v = state.agent.vel
@@ -648,23 +610,19 @@ def _score_accel(ax: int, ay: int,
     if any(np.array_equal(next_pos, q.pos) for q in state.players):
         return None
 
-    # hard rule: if there exists any other legal move, don't return to previous cell
     prev_cell = None
     if world.prev_pos is not None:
         prev_cell = tuple(world.prev_pos)
     if prev_cell is not None and (nx, ny) == prev_cell and world.no_backtrack_lock > 0:
-        # huge penalty; still allow if it's absolutely the only legal option
-        base_pen = 1e6
+        base_pen = 1e6  # strongly avoid if any other option exists
     else:
         base_pen = 0.0
 
-    # core terms
     wp = np.array(waypoint, dtype=float)
     dist_to_wp = float(np.linalg.norm(wp - next_pos))
     speed_next = float(math.hypot(nvx, nvy))
     speed_pen = abs(speed_next - target_speed)
 
-    # heading (prefer pointing velocity toward waypoint)
     heading_pen = 0.0
     if speed_next > 0.0:
         to_wp = wp - next_pos
@@ -673,14 +631,9 @@ def _score_accel(ax: int, ay: int,
             cos = float((nvx*to_wp[0] + nvy*to_wp[1]) / (speed_next * n_to))
             heading_pen = (1.0 - cos) * 0.6
 
-    # anti-oscillation
     node_pen = 0.22 * float(world.visited_count[nx, ny])
     edge_pen = 0.8 * float(world.edge_count(int(p[0]), int(p[1]), nx, ny))
-
-    # reward: stepping near UNKNOWN expands map
     explore_bonus = -0.8 if world.has_unknown_neighbor(nx, ny) else 0.0
-
-    # gentle bias to keep moving (small cost if killing speed)
     stop_bias = 0.3 if speed_next == 0.0 else 0.0
 
     score = base_pen + (2.0 * dist_to_wp) + (0.8 * speed_pen) + heading_pen + node_pen + edge_pen + stop_bias + explore_bonus
@@ -689,9 +642,6 @@ def _score_accel(ax: int, ay: int,
 def pure_pursuit_move(state: State, world: WorldModel,
                       coarse: CoarsePlanner2D,
                       rSafe: int) -> Optional[Tuple[int,int]]:
-    """
-    Default fast driver. Returns an acceleration (ax, ay) or None if it cannot find one.
-    """
     assert state.agent is not None
     agent_xy = (int(state.agent.x), int(state.agent.y))
 
@@ -713,10 +663,7 @@ def pure_pursuit_move(state: State, world: WorldModel,
     dist_left = float(len(path) - far_idx)
     target_speed = _target_speed_from_context(dist_left, curv, rSafe)
 
-    # try all 9 accelerations
     scored: List[Tuple[float, Tuple[int,int], Tuple[int,int]]] = []  # (score, (nx,ny), (ax,ay))
-    legal_candidates: List[Tuple[int,int,Tuple[int,int]]] = []
-
     for ax in (-1, 0, 1):
         for ay in (-1, 0, 1):
             res = _score_accel(ax, ay, state, world, rSafe, wp, target_speed)
@@ -724,7 +671,6 @@ def pure_pursuit_move(state: State, world: WorldModel,
                 continue
             sc, nxny = res
             scored.append((sc, nxny, (ax, ay)))
-            legal_candidates.append((ax, ay, nxny))
 
     if not scored:
         return None
@@ -741,7 +687,6 @@ def pure_pursuit_move(state: State, world: WorldModel,
         scored = non_back
         world.no_backtrack_lock = 6  # for next few steps, keep resisting backtracking
     else:
-        # dead-end: allow backtracking and clear lock soon
         world.no_backtrack_lock = max(0, world.no_backtrack_lock - 1)
 
     scored.sort(key=lambda t: t[0])
@@ -766,16 +711,13 @@ def calculateMove(world: WorldModel, planner: AStarPlanner,
     agentXY = (int(state.agent.x), int(state.agent.y))
     agentV  = (int(state.agent.vel_x), int(state.agent.vel_y))
 
-    # Update path-history stats before moving (for tabu and heading)
     if world.prev_pos is not None:
         world.last_dir = np.array(agentXY) - np.array(world.prev_pos)
     world.backtrail.append(agentXY)
 
-    # --- NEW default: fast pure-pursuit on coarse path with DFS-style rules
     fast_axay = pure_pursuit_move(state, world, coarse, rSafe)
 
     if fast_axay is None:
-        # Fallback to old target selection + 4D planner
         mode_target = _choose_committed_target(world, agentXY)
         if mode_target is not None:
             actions = planner.plan(agentXY, agentV, mode_target)
@@ -788,20 +730,16 @@ def calculateMove(world: WorldModel, planner: AStarPlanner,
     else:
         ax, ay = fast_axay
 
-    # Avoid stepping onto another player's cell (final guard)
     nextPos = state.agent.pos + state.agent.vel + np.array([ax, ay])
     if any(np.all(nextPos == p.pos) for p in state.players):
         ax, ay = 0, 0
         nextPos = state.agent.pos + state.agent.vel + np.array([ax, ay])
 
-    # Update visit counts (node + edge) to discourage retracing
     world.visited_count[agentXY[0], agentXY[1]] += 1
     nx, ny = int(nextPos[0]), int(nextPos[1])
     world.touch_edge(agentXY[0], agentXY[1], nx, ny)
 
-    # Stall bookkeeping for committed target
     if world.commit_target is not None:
-        # consider "progress" as reducing manhattan distance to committed target
         before = abs(agentXY[0]-world.commit_target[0]) + abs(agentXY[1]-world.commit_target[1])
         after  = abs(nx-world.commit_target[0]) + abs(ny-world.commit_target[1])
         if after < before:
@@ -809,14 +747,11 @@ def calculateMove(world: WorldModel, planner: AStarPlanner,
         else:
             world.stalled_steps += 1
             if world.stalled_steps >= world._STALL_RESET:
-                # give up and pick a new target
                 world.commit_ttl = 0
                 world.commit_target = None
                 world.stalled_steps = 0
 
-    # remember previous cell for DFS-style backtrack block
     world.prev_pos = agentXY
-
     return ax, ay
 
 # ---- main: strict I/O (only READY + moves on stdout) ----
@@ -828,7 +763,7 @@ def main():
 
     world = WorldModel(circuit.track_shape)
 
-    # braking guard drives speed; v_max can be lenient
+    # braking guard drives speed; v_max can be lenient (4D planner is fallback)
     R = circuit.visibility_radius
     SAFETY_MARGIN = 1
     rSafe = max(0, R - SAFETY_MARGIN)
@@ -843,12 +778,11 @@ def main():
         if state is None:
             return
         ax, ay = calculateMove(world, planner, rng, state, coarse)
-        # clamp to {-1,0,1} for the judge delta
         ax = -1 if ax < -1 else (1 if ax > 1 else int(ax))
         ay = -1 if ay < -1 else (1 if ay > 1 else int(ay))
         print(f"{ax} {ay}", flush=True)
 
 if __name__ == "__main__":
     main()
-# large1.png 120
-# arrows.png 181
+#large1.png 120
+#arrows.png 181
