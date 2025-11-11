@@ -1,6 +1,7 @@
 import sys
 import enum
 import numpy as np
+import collections  # NEW: We need a deque for the BFS
 
 from typing import Optional, NamedTuple
 
@@ -119,7 +120,6 @@ def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
             y_floor = np.floor(y).astype(int)
             
             # --- CRASH FIX ---
-            # Check if the intermediate points are in bounds *before* indexing
             if not (0 <= x < track.shape[0] and
                     0 <= y_ceil < track.shape[1] and
                     0 <= y_floor < track.shape[1]):
@@ -152,7 +152,44 @@ def valid_line(state: State, pos1: np.ndarray, pos2: np.ndarray) -> bool:
                 return False
     return True
 
-# --- NEW: "Smarter Greedy" Agent Logic ---
+# --- NEW: BFS Pathfinding Map ---
+
+def create_distance_map(global_map: np.ndarray, targets: np.ndarray) -> np.ndarray:
+    """
+    Creates a map where each cell's value is the
+    grid-distance to the nearest target.
+    """
+    distance_map = np.full(global_map.shape, np.inf)
+    queue = collections.deque()
+    
+    # Add all targets to the queue with distance 0
+    for x, y in targets:
+        if traversable(global_map[x, y]):
+            distance_map[x, y] = 0
+            queue.append((x, y))
+
+    # 8-directional neighbors
+    neighbors = [(dx, dy) for dx in [-1, 0, 1] for dy in [-1, 0, 1] if (dx, dy) != (0, 0)]
+
+    while queue:
+        x, y = queue.popleft()
+        current_dist = distance_map[x, y]
+        
+        for dx, dy in neighbors:
+            nx, ny = x + dx, y + dy
+            
+            # Check bounds
+            if not (0 <= nx < global_map.shape[0] and 0 <= ny < global_map.shape[1]):
+                continue
+                
+            # If the neighbor is traversable AND we found a shorter path
+            if traversable(global_map[nx, ny]) and distance_map[nx, ny] == np.inf:
+                distance_map[nx, ny] = current_dist + 1
+                queue.append((nx, ny))
+                
+    return distance_map
+
+# --- NEW: "Path-Guided Greedy" Agent Logic ---
 
 def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
     
@@ -170,10 +207,13 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
         # No goals AND no unknown cells. We're done or trapped.
         print("No targets found. Braking.", file=sys.stderr)
         return (0, 0)
+        
+    # 2. NEW: Create the BFS distance map
+    distance_map = create_distance_map(state.global_map, targets)
 
-    # 2. Score all 9 possible moves
+    # 3. Score all 9 possible moves
     best_score = float('inf')
-    best_move = (0, 0)
+    best_move = (0, 0) # Default to braking
     best_vel_norm = float('inf')
 
     for ax in range(-1, 2):
@@ -183,24 +223,24 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
             next_pos = self_pos + next_vel
             
             # Check for validity (THIS IS THE CRITICAL PART)
-            is_valid = True
+            is_valid = False
             try:
-                # Check line-of-sight and wall collisions
-                if not valid_line(state, self_pos, next_pos):
-                    is_valid = False
-                # Check player collisions
-                if any(np.all(next_pos.astype(int) == p.pos) for p in state.players):
-                    is_valid = False
+                # Use the fixed, robust valid_line check
+                if valid_line(state, self_pos, next_pos):
+                    # Check player collisions
+                    if not any(np.all(next_pos.astype(int) == p.pos) for p in state.players):
+                        is_valid = True
             except Exception as e:
-                # Catch any unexpected crash from valid_line
+                # Catch any unexpected crash
                 print(f"Error checking move: {e}", file=sys.stderr)
                 is_valid = False
             
             if is_valid:
                 # This is a valid move. Score it.
-                # Score = distance to *closest* target
-                distances = np.linalg.norm(targets - next_pos, axis=1)
-                score = np.min(distances)
+                # NEW SCORE: Look up the distance from our BFS map
+                next_pos_int = next_pos.astype(int)
+                score = distance_map[next_pos_int[0], next_pos_int[1]]
+                
                 vel_norm = np.linalg.norm(next_vel)
                 
                 if score < best_score:
@@ -215,12 +255,12 @@ def calculate_move(rng: np.random.Generator, state: State) -> tuple[int, int]:
                         best_move = (ax, ay)
                         best_vel_norm = vel_norm
             else:
-                # Invalid moves get no consideration
+                # Invalid moves get a score of infinity
                 pass
 
     if best_score == float('inf'):
-        # All 9 moves were invalid. We are trapped.
-        print("All moves are invalid! Braking.", file=sys.stderr)
+        # All 9 moves were invalid, or led to un-pathable areas.
+        print("All moves are invalid or lead to infinity! Braking.", file=sys.stderr)
         return (0, 0)
 
     return best_move

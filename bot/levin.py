@@ -773,3 +773,12 @@ if __name__ == "__main__":
     main()
 #large1.png 120
 #arrows.png 181
+#dios 106
+#hungaro 124
+#large1 112
+#large2 82
+#saint 88
+#small1 40
+#small2 63
+#straight 9
+#antihill_wide 113
