@@ -4,7 +4,7 @@ import numpy as np
 from collections import deque, defaultdict
 from typing import Optional, NamedTuple, Tuple, List, Dict, Set
 
-# ---------------- Types ----------------
+# ================= Types =================
 
 class CellType(enum.Enum):
     NOT_VISIBLE = 3
@@ -36,30 +36,32 @@ class State(NamedTuple):
     players: list[Player]
     agent: Player
 
-# -------------- I/O --------------------
+# ================ I/O ====================
 
 def read_initial_observation() -> Circuit:
     H, W, num_players, visibility_radius = map(int, input().split())
     return Circuit((H, W), num_players, visibility_radius)
 
-# -------------- Memory -----------------
+# ============== Memory ===================
 
 class Memory:
     def __init__(self):
         self.initialised = False
-        self.world: Optional[np.ndarray] = None     # stitched map (raw values)
-        self.safety: Optional[np.ndarray] = None    # unknown->walls
-        self.visited: Set[Tuple[int,int]] = set()   # visited cells (blocked for forward)
+        self.world: Optional[np.ndarray] = None      # raw stitched map
+        self.safety: Optional[np.ndarray] = None     # unknown -> WALL for LOS
+        self.visited: Set[Tuple[int,int]] = set()    # visited cells (forward walls)
+        self.dead_end: Set[Tuple[int,int]] = set()   # permanently avoided cells
         self.visit_count: Dict[Tuple[int,int], int] = defaultdict(int)
-        self.speed_cap_axis: int = 1                # per-axis speed cap
-        self.path: List[Tuple[int,int]] = []        # current planned path (grid cells)
+
+        self.spine: List[Tuple[int,int]] = []        # start..current path (DFS spine)
+        self.subgoal: Optional[Tuple[int,int]] = None
+        self.route: List[Tuple[int,int]] = []        # planned path to subgoal (cells)
 
     def ensure(self, circuit: Circuit):
         if not self.initialised:
             H, W = circuit.track_shape
             self.world = np.full((H, W), CellType.NOT_VISIBLE.value, dtype=int)
             self.safety = np.full((H, W), CellType.WALL.value, dtype=int)
-            self.speed_cap_axis = max(1, circuit.visibility_radius // 2)
             self.initialised = True
 
     def overlay_window(self, posx: int, posy: int, R: int, window_rows: List[List[int]]):
@@ -104,7 +106,7 @@ def read_observation(old_state: State) -> Optional[State]:
 
     MEM.overlay_window(posx, posy, cd.visibility_radius, window_rows)
 
-    # build full-size visible (compat only)
+    # keep a full-size compatible visible array (not used for planning)
     H, W = cd.track_shape
     R = cd.visibility_radius
     visible_track = np.full((H, W), CellType.NOT_VISIBLE.value, dtype=int)
@@ -120,7 +122,7 @@ def read_observation(old_state: State) -> Optional[State]:
 
     return old_state._replace(visible_track=visible_track, players=players, agent=agent)
 
-# -------------- Geometry ----------------
+# ============= Geometry / LOS ==============
 
 def clamp_idx(v: int, lo: int, hi: int) -> int:
     return lo if v < lo else hi if v > hi else v
@@ -130,7 +132,6 @@ def valid_line_on_map(track_int: np.ndarray, pos1: np.ndarray, pos2: np.ndarray)
         or np.any(pos1 >= track_int.shape) or np.any(pos2 >= track_int.shape)):
         return False
     diff = pos2 - pos1
-
     if diff[0] != 0:
         slope = diff[1] / diff[0]
         d = int(np.sign(diff[0]))
@@ -153,7 +154,7 @@ def valid_line_on_map(track_int: np.ndarray, pos1: np.ndarray, pos2: np.ndarray)
                 return False
     return True
 
-# -------------- Grid utilities ----------------
+# ============ Grid helpers =================
 
 def neighbors4(H: int, W: int, p: Tuple[int,int]):
     x, y = p
@@ -162,42 +163,93 @@ def neighbors4(H: int, W: int, p: Tuple[int,int]):
     if y > 0:         yield (x, y-1)
     if y+1 < W:       yield (x, y+1)
 
-def forward_neighbors(cur: Tuple[int,int]) -> List[Tuple[int,int]]:
-    """Unvisited, traversable immediate neighbors (visited-as-walls)."""
-    assert MEM.world is not None and MEM.safety is not None
-    H, W = MEM.world.shape
-    res = []
-    for n in neighbors4(H, W, cur):
-        x, y = n
-        if 0 <= x < H and 0 <= y < W and MEM.safety[x, y] >= 0 and (x, y) not in MEM.visited:
-            res.append(n)
-    # prefer neighbors that border unknown, then deterministic tie-break
-    def unk_score(p):
-        s = 0
-        x, y = p
-        for nx, ny in neighbors4(H, W, p):
-            if MEM.world[nx, ny] == CellType.NOT_VISIBLE.value:
-                s += 1
-        return s
-    res.sort(key=lambda p: (-unk_score(p), p[0], p[1]))
-    return res
+def ensure_spine_sync(cur: Tuple[int,int]):
+    if not MEM.spine:
+        MEM.spine.append(cur)
+        return
+    if MEM.spine[-1] == cur:
+        return
+    if cur in MEM.spine:
+        i = MEM.spine.index(cur)
+        MEM.spine[:] = MEM.spine[:i+1]
+    else:
+        MEM.spine.append(cur)
 
-def has_unvisited_neighbor(p: Tuple[int,int]) -> bool:
-    for n in forward_neighbors(p):
-        return True
-    return False
+# ======= Planning grids & frontiers =======
 
-def bfs_path(start: Tuple[int,int], is_goal) -> Optional[List[Tuple[int,int]]]:
-    """BFS on known traversable cells (visited ALLOWED) to nearest cell matching is_goal."""
+def build_forward_passable() -> np.ndarray:
+    """Forward choices: safety>=0 and not visited/dead_end."""
     assert MEM.safety is not None
-    H, W = MEM.safety.shape
-    if MEM.safety[start[0], start[1]] < 0:
+    passable = (MEM.safety >= 0).astype(np.int8)
+    for (x, y) in MEM.visited:
+        passable[x, y] = -1
+    for (x, y) in MEM.dead_end:
+        passable[x, y] = -1
+    return passable
+
+def build_passable_with_spine(cur: Tuple[int,int]) -> np.ndarray:
+    """
+    A* planning grid: safety>=0. Block visited/dead_end EXCEPT along DFS spine.
+    Current cell is always free.
+    """
+    assert MEM.safety is not None
+    passable = (MEM.safety >= 0).astype(np.int8)
+    for (x, y) in MEM.visited:
+        passable[x, y] = -1
+    for (x, y) in MEM.dead_end:
+        passable[x, y] = -1
+    for v in MEM.spine:
+        passable[v[0], v[1]] = 1
+    passable[cur[0], cur[1]] = 1
+    return passable
+
+def frontier_cells(passable: np.ndarray) -> Set[Tuple[int,int]]:
+    """Cells in 'passable' that border at least one NOT_VISIBLE tile."""
+    assert MEM.world is not None
+    H, W = passable.shape
+    out: Set[Tuple[int,int]] = set()
+    for x in range(H):
+        for y in range(W):
+            if passable[x, y] < 0:
+                continue
+            for nx, ny in neighbors4(H, W, (x, y)):
+                if MEM.world[nx, ny] == CellType.NOT_VISIBLE.value:
+                    out.add((x, y))
+                    break
+    return out
+
+# ================== A* =====================
+
+def a_star(start: Tuple[int,int], goals: Set[Tuple[int,int]], passable: np.ndarray,
+           step_cost: Dict[Tuple[int,int], int] | None = None) -> Optional[List[Tuple[int,int]]]:
+    if not goals:
         return None
-    q = deque([start])
+    H, W = passable.shape
+    sx, sy = start
+    if not (0 <= sx < H and 0 <= sy < W): return None
+    if passable[sx, sy] < 0: return None
+
+    def h(p: Tuple[int,int]) -> int:
+        # Manhattan to the nearest goal (sample up to 64)
+        x, y = p
+        dmin = 10**9
+        cnt = 0
+        for gx, gy in goals:
+            d = abs(gx - x) + abs(gy - y)
+            if d < dmin: dmin = d
+            cnt += 1
+            if cnt >= 64 and dmin <= 1: break
+        return dmin
+
+    import heapq
+    g: Dict[Tuple[int,int], int] = {start: 0}
     parent: Dict[Tuple[int,int], Optional[Tuple[int,int]]] = {start: None}
-    while q:
-        u = q.popleft()
-        if is_goal(u):
+    heap: List[Tuple[int,int,Tuple[int,int]]] = []
+    tie = 0
+    heapq.heappush(heap, (h(start), tie, start))
+    while heap:
+        _, _, u = heapq.heappop(heap)
+        if u in goals:
             # rebuild
             path = [u]
             v = u
@@ -209,146 +261,256 @@ def bfs_path(start: Tuple[int,int], is_goal) -> Optional[List[Tuple[int,int]]]:
         ux, uy = u
         for v in neighbors4(H, W, u):
             vx, vy = v
-            if not (0 <= vx < H and 0 <= vy < W):
-                continue
-            if MEM.safety[vx, vy] < 0:
-                continue
-            if v not in parent:
+            if not (0 <= vx < H and 0 <= vy < W): continue
+            if passable[vx, vy] < 0: continue
+            base = 1
+            if step_cost is not None:
+                base = step_cost.get(v, base)
+            ng = g[u] + base
+            if v not in g or ng < g[v]:
+                g[v] = ng
                 parent[v] = u
-                q.append(v)
+                tie += 1
+                heapq.heappush(heap, (ng + h(v), tie, v))
     return None
 
-def nearest_frontier_path(cur: Tuple[int,int]) -> Optional[List[Tuple[int,int]]]:
-    """Find shortest path to the closest cell that has at least one unvisited traversable neighbor."""
-    def is_frontier(u: Tuple[int,int]) -> bool:
-        # Don't require u itself to be unvisited; only that from u we can step to some NEW cell.
-        for n in forward_neighbors(u):
-            return True
-        return False
-    return bfs_path(cur, is_frontier)
+# ============== Candidate sets ==============
 
-def path_to_goal(cur: Tuple[int,int]) -> Optional[List[Tuple[int,int]]]:
-    assert MEM.world is not None
-    goals = set(map(tuple, np.argwhere(MEM.world == CellType.GOAL.value)))
-    if not goals:
-        return None
-    def is_goal(u: Tuple[int,int]) -> bool:
-        return u in goals
-    return bfs_path(cur, is_goal)
+def forward_unvisited_neighbors(cur: Tuple[int,int]) -> List[Tuple[int,int]]:
+    assert MEM.world is not None and MEM.safety is not None
+    H, W = MEM.world.shape
+    ret = []
+    pfwd = build_forward_passable()
+    for nx, ny in neighbors4(H, W, cur):
+        if 0 <= nx < H and 0 <= ny < W and pfwd[nx, ny] >= 0:
+            ret.append((nx, ny))
+    # prefer neighbors that border lots of unknown
+    def unk_score(p):
+        s = 0
+        x, y = p
+        for ax, ay in neighbors4(H, W, p):
+            if MEM.world[ax, ay] == CellType.NOT_VISIBLE.value:
+                s += 1
+        return s
+    ret.sort(key=lambda p: (-unk_score(p), p[0], p[1]))
+    return ret
 
-# -------------- Acceleration towards a single next cell ----------------
+# ========= Unit-step motion (|vel|<=1) =========
 
 ACCELS = [(ax, ay) for ax in (-1,0,1) for ay in (-1,0,1)]
 
-def choose_accel_to_cell(state: State, target_cell: Tuple[int,int]) -> Tuple[int,int]:
+def unitstep_allowed(state: State, new_vel: np.ndarray) -> bool:
     assert MEM.safety is not None
-    safety = MEM.safety
-    H, W = safety.shape
+    H, W = MEM.safety.shape
     self_pos = state.agent.pos.astype(int)
-    self_vel = state.agent.vel.astype(int)
-    max_ax = MEM.speed_cap_axis
-    others = [p.pos for p in state.players if not np.array_equal(p.pos, self_pos)]
-
-    def allowed(a: Tuple[int,int]) -> bool:
-        ax, ay = a
-        if abs(ax) > 1 or abs(ay) > 1: return False
-        new_vel = self_vel + np.array([ax, ay], dtype=int)
-        if abs(new_vel[0]) > max_ax or abs(new_vel[1]) > max_ax:
+    new_pos = self_pos + new_vel
+    if new_pos[0] < 0 or new_pos[1] < 0 or new_pos[0] >= H or new_pos[1] >= W:
+        return False
+    if MEM.safety[new_pos[0], new_pos[1]] < 0:
+        return False
+    if not valid_line_on_map(MEM.safety, self_pos, new_pos):
+        return False
+    for p in state.players:
+        if np.array_equal(new_pos, p.pos):
             return False
-        new_pos = self_pos + new_vel
-        if new_pos[0] < 0 or new_pos[1] < 0 or new_pos[0] >= H or new_pos[1] >= W:
-            return False
-        if not valid_line_on_map(safety, self_pos, new_pos):
-            return False
-        if any(np.array_equal(new_pos, p) for p in others):
-            return False
-        return True
+    return True
 
-    # try exact landing
-    tgt = np.array(target_cell, dtype=int)
-    desired_v = tgt - self_pos
-    base_a = tuple(np.clip((desired_v - self_vel), -1, 1).astype(int).tolist())
+def accel_to_unit(state: State, desired_vel: np.ndarray) -> Tuple[int,int]:
+    cur_vel = state.agent.vel.astype(int)
+    # if overspeed, brake toward 0
+    if abs(cur_vel[0]) > 1 or abs(cur_vel[1]) > 1:
+        b = -np.sign(cur_vel)
+        return int(np.clip(b[0], -1, 1)), int(np.clip(b[1], -1, 1))
+    desired = np.clip(desired_vel, -1, 1).astype(int)
+    a = np.clip(desired - cur_vel, -1, 1).astype(int)
+    nv = np.clip(cur_vel + a, -1, 1)
+    if unitstep_allowed(state, nv):
+        return int(a[0]), int(a[1])
+    # try braking
+    b = -np.sign(cur_vel)
+    nv2 = np.clip(cur_vel + b, -1, 1)
+    if unitstep_allowed(state, nv2):
+        return int(b[0]), int(b[1])
+    # try anything safe within unit bounds
+    for ax, ay in ACCELS:
+        nv3 = np.clip(cur_vel + np.array([ax, ay], int), -1, 1)
+        if unitstep_allowed(state, nv3):
+            return ax, ay
+    return 0, 0
 
-    cands: List[Tuple[int,int]] = []
-    for dx, dy in [(0,0),(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]:
-        a = (int(np.clip(base_a[0]+dx, -1, 1)), int(np.clip(base_a[1]+dy, -1, 1)))
-        if a not in cands: cands.append(a)
-    if (0,0) in cands:
-        cands.remove((0,0))
-        cands.append((0,0))
+# ============== Subgoal manager ==============
 
-    for a in cands:
-        if allowed(a):
-            new_pos = self_pos + (self_vel + np.array(a, int))
-            if int(new_pos[0]) == target_cell[0] and int(new_pos[1]) == target_cell[1]:
-                return a
+def ensure_spine_and_mark(state: State):
+    cur = tuple(state.agent.pos.tolist())
+    ensure_spine_sync(cur)
+    MEM.mark_visit(cur)
 
-    # otherwise choose the allowed accel that gets closest (L1) with small speed penalty
-    best_a, best_score = None, 1e9
-    for a in ACCELS:
-        if not allowed(a): continue
-        new_vel = self_vel + np.array(a, int)
-        new_pos = self_pos + new_vel
-        dist = abs(int(new_pos[0])-target_cell[0]) + abs(int(new_pos[1])-target_cell[1])
-        score = dist + 0.2*(abs(int(new_vel[0])) + abs(int(new_vel[1])))
-        if score < best_score:
-            best_score, best_a = score, a
-    if best_a is not None:
-        return best_a
-
-    # braking fallback
-    brake = tuple((-np.sign(self_vel)).astype(int).tolist())
-    return brake if allowed(brake) else (0,0)
-
-def brake_or_wait(state: State) -> Tuple[int,int]:
-    self_vel = state.agent.vel.astype(int)
-    return tuple((-np.sign(self_vel)).astype(int).tolist())
-
-# -------------- High-level decision ----------------
-
-def plan_path(state: State) -> List[Tuple[int,int]]:
-    """Build a path [cur, next, ...]; we will only use the next step."""
+def recompute_subgoal_and_route(state: State):
+    """Pick a stable subgoal (GOAL else best frontier) and compute route to it with A*."""
     assert MEM.world is not None and MEM.safety is not None
     cur = tuple(state.agent.pos.tolist())
 
-    # 1) If goal is known, shortest path to goal
-    pg = path_to_goal(cur)
-    if pg and len(pg) >= 2:
-        return pg
+    # 1) GOAL known? Use GOAL with standard safety passability (visited allowed).
+    goals = set(map(tuple, np.argwhere(MEM.world == CellType.GOAL.value)))
+    if goals:
+        passable = (MEM.safety >= 0).astype(np.int8)
+        path = a_star(cur, goals, passable)
+        if path and len(path) >= 2:
+            MEM.subgoal = path[-1]
+            MEM.route = path
+            return
 
-    # 2) If we can go forward to an unvisited neighbor, take that immediate step (strict DFS forward)
-    fwd = forward_neighbors(cur)
-    if fwd:
-        return [cur, fwd[0]]
+    # 2) Otherwise choose the best frontier under spine-only backtracking.
+    passable = build_passable_with_spine(cur)
+    frontiers = frontier_cells(passable)
+    if not frontiers:
+        # no frontiers visible → if we still have spine, step toward parent by planning
+        path = a_star(cur, set(MEM.spine[:-1]), passable)
+        if path and len(path) >= 2:
+            MEM.subgoal = path[-1]
+            MEM.route = path
+        else:
+            MEM.subgoal, MEM.route = None, []
+        return
 
-    # 3) Otherwise, BFS to nearest frontier (cell that has some unvisited traversable neighbor)
-    pf = nearest_frontier_path(cur)
-    if pf and len(pf) >= 2:
-        return pf
+    # Rank frontiers by path length; tie-break by local unknown count (info gain)
+    # Limit candidate evaluation for speed: keep the K closest by heuristic
+    def h_est(p: Tuple[int,int]) -> int:
+        return abs(p[0]-cur[0]) + abs(p[1]-cur[1])
+    K = 64
+    cand = sorted(list(frontiers), key=h_est)[:K]
 
-    # 4) Nowhere to go (fully explored known area, no goal seen) -> stop/brake
-    return [cur]
+    # Penalize using the spine (we allow it but make it slightly "expensive").
+    step_cost: Dict[Tuple[int,int], int] = {}
+    for v in MEM.spine:
+        step_cost[v] = 3  # higher cost than unexplored (1)
+
+    best = None
+    best_key = (10**9, -1, 10**9)
+    for tgt in cand:
+        path = a_star(cur, {tgt}, passable, step_cost=step_cost)
+        if not path: 
+            continue
+        plen = len(path)
+        # info gain around target
+        unk = 0
+        for nx, ny in neighbors4(*MEM.world.shape, tgt):
+            if MEM.world[nx, ny] == CellType.NOT_VISIBLE.value:
+                unk += 1
+        key = (plen, -unk, h_est(tgt))
+        if key < best_key:
+            best_key = key
+            best = (tgt, path)
+
+    if best is None:
+        # fall back: any reachable cell (spine allowed) to keep moving
+        all_ok = {(x,y) for x in range(MEM.safety.shape[0]) for y in range(MEM.safety.shape[1]) if passable[x,y]>=0}
+        path = a_star(cur, all_ok, passable)
+        if path and len(path) >= 2:
+            MEM.subgoal = path[-1]
+            MEM.route = path
+        else:
+            MEM.subgoal, MEM.route = None, []
+        return
+
+    MEM.subgoal, MEM.route = best[0], best[1]
+
+def need_new_subgoal(state: State) -> bool:
+    if MEM.subgoal is None or not MEM.route:
+        return True
+    cur = tuple(state.agent.pos.tolist())
+    # If current not on route or subgoal reached → refresh
+    if cur not in MEM.route:
+        return True
+    if cur == MEM.subgoal:
+        return True
+    return False
+
+def next_step_from_route(state: State) -> Optional[Tuple[int,int]]:
+    """Return the next cell toward the current subgoal; repair route if needed."""
+    cur = tuple(state.agent.pos.tolist())
+    if need_new_subgoal(state):
+        recompute_subgoal_and_route(state)
+    if not MEM.route or cur not in MEM.route:
+        return None
+    i = MEM.route.index(cur)
+    if i+1 >= len(MEM.route):
+        return None
+    return MEM.route[i+1]
+
+# =============== High level =================
+
+def after_move_spine_bookkeeping(old: Tuple[int,int], new: Tuple[int,int]):
+    """Maintain DFS spine and dead_end marking for 'only backtrack when necessary'."""
+    # Forward step into an unvisited -> push
+    if new not in MEM.spine:
+        MEM.spine.append(new)
+        return
+    # If we stepped back to parent and old had no forward options, mark it dead_end and pop.
+    if len(MEM.spine) >= 2 and new == MEM.spine[-2]:
+        # Check forward options from 'old' respecting visited/dead_end as walls
+        pfwd = build_forward_passable()
+        has_new = False
+        H, W = pfwd.shape
+        x, y = old
+        for nx, ny in neighbors4(H, W, (x, y)):
+            if 0 <= nx < H and 0 <= ny < W and pfwd[nx, ny] >= 0:
+                has_new = True
+                break
+        if not has_new:
+            MEM.dead_end.add(old)
+        MEM.spine.pop()  # drop old; new is now top
 
 def calculate_move(state: State) -> tuple[int, int]:
-    MEM.mark_visit(tuple(state.agent.pos.tolist()))
-
-    # keep path fresh and trimmed
     cur = tuple(state.agent.pos.tolist())
-    if not MEM.path or cur not in MEM.path:
-        MEM.path = plan_path(state)
-    else:
-        i = MEM.path.index(cur)
-        MEM.path = MEM.path[i:]
+    ensure_spine_and_mark(state)
 
-    if len(MEM.path) <= 1:
-        ax, ay = brake_or_wait(state)
-        return (int(ax), int(ay))
+    # Clear stale subgoal if reached
+    if MEM.subgoal is not None and cur == MEM.subgoal:
+        MEM.subgoal, MEM.route = None, []
 
-    next_cell = MEM.path[1]
-    ax, ay = choose_accel_to_cell(state, next_cell)
-    return (int(ax), int(ay))
+    # Decide the next cell from the subgoal route
+    nxt = next_step_from_route(state)
 
-# -------------- Main -----------------------
+    # If still no plan, try simple forward neighbor, else controlled one-step back
+    if nxt is None:
+        fwd = forward_unvisited_neighbors(cur)
+        if fwd:
+            nxt = fwd[0]
+            # create a trivial local route
+            MEM.route = [cur, nxt]
+            MEM.subgoal = nxt
+        elif len(MEM.spine) >= 2:
+            parent = MEM.spine[-2]
+            nxt = parent
+            MEM.route = [cur, parent]
+            MEM.subgoal = parent
+        else:
+            # brake to zero
+            cv = state.agent.vel.astype(int)
+            b = -np.sign(cv)
+            return int(np.clip(b[0], -1, 1)), int(np.clip(b[1], -1, 1))
+
+    # Convert next cell into a unit-step velocity
+    cur_pos = state.agent.pos.astype(int)
+    target = np.array(nxt, dtype=int)
+    diff = target - cur_pos
+    if abs(diff[0]) + abs(diff[1]) > 1:
+        # route is always 4-neighbor, but guard anyway
+        if abs(diff[0]) >= abs(diff[1]): diff = np.array([np.sign(diff[0]), 0], int)
+        else: diff = np.array([0, np.sign(diff[1])], int)
+
+    ax, ay = accel_to_unit(state, diff)
+
+    # Predict next cell if accel is applied (unit-speed model)
+    new_vel = np.clip(state.agent.vel.astype(int) + np.array([ax, ay], int), -1, 1)
+    new_pos = tuple((cur_pos + new_vel).tolist())
+    if new_pos != cur:
+        after_move_spine_bookkeeping(cur, new_pos)
+
+    return int(ax), int(ay)
+
+# ================ Main =====================
 
 def main():
     print('READY', flush=True)
