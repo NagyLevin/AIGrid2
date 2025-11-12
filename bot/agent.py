@@ -234,7 +234,7 @@ class LeftWallPolicy:
     --- HYBRID POLICY ---
     Uses a different strategy based on the agent's current cell.
     
-    --- NEW CORRIDOR LOGIC ---
+    --- CORRIDOR LOGIC ---
     Corridor rule now checks 2 tiles to the left/right to detect
     wider hallways and prevent "bouncing".
     """
@@ -312,7 +312,7 @@ class LeftWallPolicy:
         dR = right_of(dF)
         dB = back_of(dF)
 
-        # --- NEW: Define coords for 1 and 2 tiles away ---
+        # --- Define coords for 1 and 2 tiles away ---
         l1x, l1y = ax + dL[0], ay + dL[1]
         l2x, l2y = ax + dL[0]*2, ay + dL[1]*2
         
@@ -322,7 +322,7 @@ class LeftWallPolicy:
         f1x, f1y = ax + dF[0], ay + dF[1]
         b1x, b1y = ax + dB[0], ay + dB[1]
 
-        # --- NEW: Corridor rule checks 2 tiles deep ---
+        # --- Corridor rule checks 2 tiles deep ---
         # "closer than 3 tiles" means at 1 or 2 tiles
         wall_on_left = self._is_wall_local(state, l1x, l1y) or self._is_wall_local(state, l2x, l2y)
         wall_on_right = self._is_wall_local(state, r1x, r1y) or self._is_wall_local(state, r2x, r2y)
@@ -421,35 +421,81 @@ def choose_accel_toward_cell(state: State,
     # --- Speed Logic ---
     ax_agent, ay_agent = int(state.agent.x), int(state.agent.y)
     
-    # 1. Check for *any* (8-dir) adjacent "0 cells"
-    has_adjacent_zero = False
-    for dx, dy in DIRS_8: 
+    # 1. Check for "easy" 0-cells (cardinal directions)
+    has_adjacent_zero_4dir = False
+    for dx, dy in DIRS_4: 
         nx, ny = ax_agent + dx, ay_agent + dy
         if (world.traversable(nx, ny) and
             world.known_map[nx, ny] == CellType.EMPTY.value and
             world.visited_count[nx, ny] == 0):
-            has_adjacent_zero = True
+            has_adjacent_zero_4dir = True
             break
             
-    # 2. If no adjacent "0 cells", scan visible range for one
+    # 2. Check for *any* 0-cells (including diagonal)
+    has_adjacent_zero_8dir = False
+    if has_adjacent_zero_4dir:
+         has_adjacent_zero_8dir = True # Optimization
+    else:
+        for dx, dy in DIRS_8: 
+            nx, ny = ax_agent + dx, ay_agent + dy
+            if (world.traversable(nx, ny) and
+                world.known_map[nx, ny] == CellType.EMPTY.value and
+                world.visited_count[nx, ny] == 0):
+                has_adjacent_zero_8dir = True
+                break
+            
+    # 3. If no adjacent "0 cells", scan visible range for one
     visible_zero_reachable = False
-    if not has_adjacent_zero:
+    if not has_adjacent_zero_8dir:
         visible_zero_reachable = find_reachable_zero(state, world, state.agent.pos)
 
-    # 3. Set target speed based on mode and sensor checks
+    # 4. This is the "stop beforehand" logic
+    force_slow_down = (not has_adjacent_zero_4dir and has_adjacent_zero_8dir) or \
+                      (not has_adjacent_zero_8dir and visible_zero_reachable)
+    
+    # --- NEW "FULL STOP" OVERRIDE ---
+    # If we are forced to slow down for a turn AND we are currently moving.
+    if force_slow_down and (vx != 0 or vy != 0):
+        
+        # We need to stop. Let's find the best *safe* way to brake.
+        # Priority: 1. Full Brake, 2. Coast (0,0)
+        
+        possible_brakes = [
+            (-int(np.sign(vx)), -int(np.sign(vy))), # Full Brake
+            (0, 0)                                  # Coast
+        ]
+        
+        for ax, ay in possible_brakes:
+            nvx, nvy = vx + ax, vy + ay
+            next_pos = p + v + np.array([ax, ay], dtype=int)
+            
+            if brakingOk(nvx, nvy, rSafe) and \
+               validLineLocal(state, p, next_pos) and \
+               not any(np.all(next_pos == q.pos) for q in state.players):
+                # This is a safe braking move. Take it immediately.
+                return ax, ay
+        
+        # If neither full brake nor coasting is safe, we are in a bad spot.
+        # Fall through to the main loop to try and find *any* safe move
+        # (the main loop will still prefer slowing down due to target_speed=1.0)
+    # --- END OF OVERRIDE ---
+
+
+    # 5. Set target speed (this is now the fallback)
     max_safe = max(1.0, math.sqrt(2 * max(0, rSafe)))
     
-    if mode == "corridor_unvisited":
-        # Rule: Accelerate in unvisited corridors
+    if mode == "corridor_unvisited" and not force_slow_down:
+        # Rule: Accelerate in unvisited corridors (if not forced to slow for a turn)
         target_speed = max_safe
-    elif not has_adjacent_zero and visible_zero_reachable:
-        # Rule: No adjacent 0, but can see one. Limit speed to 1.
+    elif force_slow_down:
+        # Rule: (A) Only diagonal '0' nearby OR (B) Only distant '0' visible
+        # -> Limit speed to 1.0 (will apply if vx/vy were already 0)
         target_speed = 1.0
     elif mode.startswith("search_") or mode == "corridor_visited" or mode.startswith("fallback"):
         # Rule: In "search mode" (moving to a visited cell), be cautious.
         target_speed = max(1.0, 0.5 * max_safe)
     else:
-        # Default (e.g., "explore" or "forward" onto a 0-cell)
+        # Default (e.g., "explore" or "forward" onto an easy 4-dir 0-cell)
         target_speed = max(1.5, 0.7 * max_safe)
     # --- End Speed Logic ---
 
@@ -459,6 +505,7 @@ def choose_accel_toward_cell(state: State,
 
     best = None    # (score, (ax,ay))
 
+    # This loop is now the FALLBACK if the "FULL STOP" override doesn't trigger
     for ax in (-1, 0, 1):
         for ay in (-1, 0, 1):
             nvx, nvy = vx + ax, vy + ay
@@ -474,7 +521,7 @@ def choose_accel_toward_cell(state: State,
 
             dist_cell = float(np.linalg.norm(next_pos.astype(float) - np.array(target_cell, dtype=float)))
             speed_next = float(math.hypot(nvx, nvy))
-            speed_pen = abs(speed_next - target_speed)
+            speed_pen = abs(speed_next - target_speed) # This now punishes high speed
 
             heading_pen = 0.0
             if speed_next > 0.0:
@@ -495,7 +542,7 @@ def choose_accel_toward_cell(state: State,
     if best is not None:
         return best[1]
 
-    # Fallbacks: Try to just brake
+    # Fallbacks: Try to just brake (This is a final failsafe)
     for ax, ay in ((-np.sign(vx), -np.sign(vy)), (0, 0)):
         nvx, nvy = vx + ax, vy + ay
         nxt = p + v + np.array([ax, ay], dtype=int)
@@ -564,6 +611,7 @@ def dump_ascii(world: WorldModel, policy: LeftWallPolicy, state: State, mode: st
         lines.append("".join(grid[x]))
     lines.append("")
 
+
     mode_flag = "a"
     if not world._dump_initialized:
         mode_flag = "w"
@@ -586,7 +634,7 @@ def calculateMove(world: WorldModel, policy: LeftWallPolicy, state: State) -> Tu
     # Policy now implements the HYBRID logic
     target_cell, mode = policy.next_grid_target(state)
     
-    # Accel choice remains the same
+    # Accel choice now implements the new "FULL STOP" override
     ax_cmd, ay_cmd = choose_accel_toward_cell(state, world, policy, target_cell, mode)
 
     world.last_pos = (ax, ay)
