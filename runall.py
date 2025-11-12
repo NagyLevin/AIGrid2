@@ -22,8 +22,8 @@ os.makedirs(os.path.join(BASE_DIR, "output"), exist_ok=True)
 BOTS: List[Tuple[str, str]] = [
     
     #("BOT1", "lieutenant_crown_him_with_many_crowns_thy_full_gallant_legions_he_found_it_in_him_to_forgive.py"),
-    #("BOT2", "levin.py"),
-    ("BOT3", "agent.py"),
+    ("BOT2", "levin.py"),
+    #("BOT3", "agent.py"),
     #("BOT4", "gogoat.py"),
     # Példa: ("SAJAT_BOT", "my_cool_bot.py"),
 ]
