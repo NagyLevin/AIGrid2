@@ -1,6 +1,7 @@
 import sys
 import enum
 import math
+import os  # <-- 1. IMPORT OS
 from collections import defaultdict, deque
 from typing import Optional, NamedTuple, Tuple, List, Dict, Set
 
@@ -65,7 +66,7 @@ def read_observation(old_state: State) -> Optional[State]:
         players.append(Player(pposx, pposy, 0, 0))
 
     H, W = circuit.track_shape
-    R = circuit.visibility_radius
+    R = circuit.visibility_radius  # <--- *** HERE IS THE FIX ***
     visible_raw = np.full((H, W), CellType.NOT_VISIBLE.value, dtype=int)
     visible_track = np.full((H, W), CellType.WALL.value, dtype=int)
 
@@ -198,7 +199,7 @@ class WorldModel:
 
         # ascii dump bookkeeping
         self.turn = 0
-        self.dump_file = "map_dump.txt"
+        self.dump_file = "logs/map_dump.txt" # <-- 1. CHANGED PATH
         self._dump_initialized = False
 
     def updateWithObservation(self, st: State) -> None:
@@ -453,7 +454,7 @@ def choose_accel_toward_cell(state: State,
     force_slow_down = (not has_adjacent_zero_4dir and has_adjacent_zero_8dir) or \
                       (not has_adjacent_zero_8dir and visible_zero_reachable)
     
-    # --- NEW "FULL STOP" OVERRIDE ---
+    # --- "FULL STOP" OVERRIDE ---
     # If we are forced to slow down for a turn AND we are currently moving.
     if force_slow_down and (vx != 0 or vy != 0):
         
@@ -475,27 +476,30 @@ def choose_accel_toward_cell(state: State,
                 # This is a safe braking move. Take it immediately.
                 return ax, ay
         
-        # If neither full brake nor coasting is safe, we are in a bad spot.
-        # Fall through to the main loop to try and find *any* safe move
-        # (the main loop will still prefer slowing down due to target_speed=1.0)
-    # --- END OF OVERRIDE ---
-
-
-    # 5. Set target speed (this is now the fallback)
+    # --- 5. Set target speed (This is the main logic) ---
+    
     max_safe = max(1.0, math.sqrt(2 * max(0, rSafe)))
     
-    if mode == "corridor_unvisited" and not force_slow_down:
-        # Rule: Accelerate in unvisited corridors (if not forced to slow for a turn)
-        target_speed = max_safe
-    elif force_slow_down:
+    if force_slow_down:
         # Rule: (A) Only diagonal '0' nearby OR (B) Only distant '0' visible
         # -> Limit speed to 1.0 (will apply if vx/vy were already 0)
         target_speed = 1.0
+        
+    # <-- 2. NEW ACCELERATION LOGIC -->
+    # Check the target cell *we are aiming for*
+    elif 0 <= target_cell[0] < world.shape[0] and 0 <= target_cell[1] < world.shape[1] and \
+         world.visited_count[target_cell[0], target_cell[1]] == 0:
+        # Rule: We are on a 0-cell (from policy) and *targeting* another 0-cell
+        # -> GO FAST!
+        target_speed = max_safe
+    # <-- END NEW LOGIC -->
+    
     elif mode.startswith("search_") or mode == "corridor_visited" or mode.startswith("fallback"):
         # Rule: In "search mode" (moving to a visited cell), be cautious.
         target_speed = max(1.0, 0.5 * max_safe)
+        
     else:
-        # Default (e.g., "explore" or "forward" onto an easy 4-dir 0-cell)
+        # Fallback (e.g., on 0-cell, but forced to move to a 10-cell)
         target_speed = max(1.5, 0.7 * max_safe)
     # --- End Speed Logic ---
 
@@ -611,6 +615,10 @@ def dump_ascii(world: WorldModel, policy: LeftWallPolicy, state: State, mode: st
         lines.append("".join(grid[x]))
     lines.append("")
 
+    # <-- 1. CREATE LOGS FOLDER IF NEEDED -->
+    log_dir = os.path.dirname(world.dump_file)
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir)
 
     mode_flag = "a"
     if not world._dump_initialized:
@@ -634,7 +642,7 @@ def calculateMove(world: WorldModel, policy: LeftWallPolicy, state: State) -> Tu
     # Policy now implements the HYBRID logic
     target_cell, mode = policy.next_grid_target(state)
     
-    # Accel choice now implements the new "FULL STOP" override
+    # Accel choice now implements the new "FULL STOP" and "GO FAST" logic
     ax_cmd, ay_cmd = choose_accel_toward_cell(state, world, policy, target_cell, mode)
 
     world.last_pos = (ax, ay)
