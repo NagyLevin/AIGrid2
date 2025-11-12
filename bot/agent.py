@@ -1,8 +1,8 @@
 import sys
 import enum
 import math
-from collections import defaultdict
-from typing import Optional, NamedTuple, Tuple, List, Dict, Set
+from collections import deque
+from typing import Optional, NamedTuple, Tuple, List
 
 import numpy as np
 
@@ -100,11 +100,9 @@ def tri(n: int) -> int:
     return n*(n+1)//2
 
 def brakingOk(vx: int, vy: int, rSafe: int) -> bool:
-    # each axis must be stoppable within safe radius
     return (tri(abs(vx)) <= rSafe) and (tri(abs(vy)) <= rSafe)
 
 def validLineLocal(state: State, p1: np.ndarray, p2: np.ndarray) -> bool:
-    # collision check only within the CURRENT visible window (safe-by-visibility)
     track = state.visible_track
     if track is None: return False
     H, W = track.shape
@@ -131,11 +129,10 @@ def validLineLocal(state: State, p1: np.ndarray, p2: np.ndarray) -> bool:
     return True
 
 # ────────────────────────────────────────────────────────────────────────────────
-# World model (simple; plus ASCII dumping)
+# World model (TTL soft-blocking + corridor / wall-hug subgoals + ASCII)
 # ────────────────────────────────────────────────────────────────────────────────
 
 def is_traversable_val(v: int) -> bool:
-    # Treat UNKNOWN as not traversable for planning; it becomes known once seen
     return (v >= 0) and (v != CellType.UNKNOWN.value)
 
 class WorldModel:
@@ -144,6 +141,10 @@ class WorldModel:
         self.shape = shape
         self.known_map = np.full((H, W), CellType.UNKNOWN.value, dtype=int)
         self.visited_count = np.zeros((H, W), dtype=int)
+
+        self.block_ttl = np.zeros((H, W), dtype=np.int16)  # TTL > 0 means "soft-blocked"
+        self.BLOCK_TTL_DEFAULT = 40
+
         self.last_pos: Optional[Tuple[int,int]] = None
 
         # ascii dump bookkeeping
@@ -162,11 +163,116 @@ class WorldModel:
         if not (0 <= x < H and 0 <= y < W): return False
         return is_traversable_val(self.known_map[x, y])
 
+    def is_blocked(self, x: int, y: int) -> bool:
+        H, W = self.shape
+        if not (0 <= x < H and 0 <= y < W): return True
+        return self.block_ttl[x, y] > 0
+
+    def decay_blocks(self) -> None:
+        bt = self.block_ttl
+        pos = bt > 0
+        bt[pos] -= 1
+
+    # ---- judge-wall queries (DO NOT count soft-blocks as walls) ----
+    def _is_judge_wall(self, x: int, y: int) -> bool:
+        H, W = self.shape
+        if not (0 <= x < H and 0 <= y < W): return True
+        return self.known_map[x, y] == CellType.WALL.value
+
+    def _free_known(self, x: int, y: int) -> bool:
+        H, W = self.shape
+        if not (0 <= x < H and 0 <= y < W): return False
+        v = self.known_map[x, y]
+        return v == CellType.EMPTY.value or v == CellType.START.value or v == CellType.GOAL.value
+
+    def is_corridor_cell(self, x: int, y: int) -> bool:
+        if not self._free_known(x, y):
+            return False
+        N = self._is_judge_wall(x-1, y)
+        S = self._is_judge_wall(x+1, y)
+        W = self._is_judge_wall(x, y-1)
+        E = self._is_judge_wall(x, y+1)
+        ns_corr = N and S and (not W) and (not E)
+        we_corr = W and E and (not N) and (not S)
+        return ns_corr or we_corr
+
+    def is_wall_adjacent(self, x: int, y: int) -> bool:
+        return (self._is_judge_wall(x-1, y) or self._is_judge_wall(x+1, y) or
+                self._is_judge_wall(x, y-1) or self._is_judge_wall(x, y+1))
+
+    def bfs_to_nearest_corridor(self, start: Tuple[int,int], forbid_first: Optional[Tuple[int,int]]) -> Optional[List[Tuple[int,int]]]:
+        sx, sy = start
+        H, W = self.shape
+        if not (0 <= sx < H and 0 <= sy < W): return None
+        if not self.traversable(sx, sy): return None
+
+        q = deque([(sx, sy)])
+        prev = {(sx, sy): None}
+        while q:
+            x, y = q.popleft()
+            if self.is_corridor_cell(x, y):
+                path = []
+                cur = (x, y)
+                while cur is not None:
+                    path.append(cur)
+                    cur = prev[cur]
+                path.reverse()
+                if forbid_first and len(path) >= 2 and path[1] == forbid_first:
+                    pass
+                else:
+                    return path
+            for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                nx, ny = x+dx, y+dy
+                if not (0 <= nx < H and 0 <= ny < W): continue
+                if (nx, ny) in prev: continue
+                if not self.traversable(nx, ny): continue
+                prev[(nx, ny)] = (x, y)
+                q.append((nx, ny))
+        return None
+
+    def bfs_to_nearest_wallhug(self, start: Tuple[int,int], forbid_first: Optional[Tuple[int,int]]) -> Optional[List[Tuple[int,int]]]:
+        sx, sy = start
+        H, W = self.shape
+        if not (0 <= sx < H and 0 <= sy < W): return None
+        if not self.traversable(sx, sy): return None
+
+        def search(allow_blocked: bool) -> Optional[List[Tuple[int,int]]]:
+            q = deque([(sx, sy)])
+            prev = {(sx, sy): None}
+            while q:
+                x, y = q.popleft()
+                if self.is_wall_adjacent(x, y):
+                    path = []
+                    cur = (x, y)
+                    while cur is not None:
+                        path.append(cur)
+                        cur = prev[cur]
+                    path.reverse()
+                    if forbid_first and len(path) >= 2 and path[1] == forbid_first:
+                        pass
+                    else:
+                        return path
+                for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                    nx, ny = x+dx, y+dy
+                    if not (0 <= nx < H and 0 <= ny < W): continue
+                    if (nx, ny) in prev: continue
+                    if not self.traversable(nx, ny): continue
+                    if (not allow_blocked) and self.is_blocked(nx, ny):
+                        continue
+                    prev[(nx, ny)] = (x, y)
+                    q.append((nx, ny))
+            return None
+
+        path = search(allow_blocked=False)
+        if path is None:
+            path = search(allow_blocked=True)
+        return path
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Left-hand wall follower (no hand-flipping, deterministic)
+# Left/right adaptive wall follower with corridor & wall-hug subgoals + anti-backstep
 # ────────────────────────────────────────────────────────────────────────────────
 
-DIRS = [(-1, 0), (0, 1), (1, 0), (0, -1)]  # N, E, S, W in grid coords
+DIRS = [(-1, 0), (0, 1), (1, 0), (0, -1)]  # N, E, S, W
 
 def left_of(d: Tuple[int,int]) -> Tuple[int,int]:
     dx, dy = d
@@ -180,22 +286,21 @@ def back_of(d: Tuple[int,int]) -> Tuple[int,int]:
     dx, dy = d
     return (-dx, -dy)
 
-class LeftWallPolicy:
+class WallPolicy:
     """
-    Pure left-hand rule:
-        - If LEFT is free → turn LEFT.
-        - else if FRONT is free → go STRAIGHT.
-        - else if RIGHT is free → turn RIGHT.
-        - else → turn BACK.
+    Priorities:
+      1) Subgoal: go to a **corridor** (judge walls on both sides).
+      2) Subgoal: if none, go to the **nearest judge-wall-adjacent** cell (to start/keep wall-follow).
+      3) Local wall-follow: prefer **LEFT**; if no left wall but **RIGHT** wall exists, hug **RIGHT**.
+      4) Never step **back** to last_pos unless dead end. Respect soft-blocks; use them only when stuck.
 
-    Corridor rule:
-        - If walls on BOTH sides (left & right), prefer STRAIGHT and aim to accelerate.
+    We ignore other players entirely.
     """
     def __init__(self, world: WorldModel) -> None:
         self.world = world
         self.heading: Tuple[int,int] = (0, 1)  # default EAST
+        self.last_mode: str = "init"
 
-    # local sensing helpers (use visible_* so it reflects current frame)
     def _is_wall_local(self, state: State, x: int, y: int) -> bool:
         if state.visible_raw is None: return False
         H, W = state.visible_raw.shape
@@ -209,7 +314,6 @@ class LeftWallPolicy:
         return state.visible_track[x, y] >= 0
 
     def _ensure_heading(self, state: State) -> None:
-        # If we have velocity, align heading with its dominant axis; else keep current.
         if state.agent is None: return
         vx, vy = int(state.agent.vel_x), int(state.agent.vel_y)
         if vx == 0 and vy == 0:
@@ -219,10 +323,10 @@ class LeftWallPolicy:
         else:
             self.heading = (0, int(np.sign(vy)))
 
-    def next_grid_target(self, state: State) -> Tuple[Tuple[int,int], str]:
+    def _choose_by_hand(self, state: State) -> Tuple[Tuple[int,int], str]:
         assert state.agent is not None
         ax, ay = int(state.agent.x), int(state.agent.y)
-        self._ensure_heading(state)
+        last = self.world.last_pos
 
         dF = self.heading
         dL = left_of(dF)
@@ -242,79 +346,150 @@ class LeftWallPolicy:
         right_free  = self._is_free_local(state, rx, ry)
         back_free   = self._is_free_local(state, bx, by)
 
-        # Corridor: walls on both sides → go straight if possible, and speed up.
-        if left_wall and right_wall and front_free:
-            # keep heading
+        w = self.world
+        left_unblocked  = left_free  and (not w.is_blocked(lx, ly))
+        front_unblocked = front_free and (not w.is_blocked(fx, fy))
+        right_unblocked = right_free and (not w.is_blocked(rx, ry))
+        back_unblocked  = back_free  and (not w.is_blocked(bx, by))
+
+        def not_back(cell):
+            return (last is None) or (cell != last)
+
+        left_ok   = left_unblocked  and not_back((lx, ly))
+        front_ok  = front_unblocked and not_back((fx, fy))
+        right_ok  = right_unblocked and not_back((rx, ry))
+
+        dead_end = (not left_ok) and (not front_ok) and (not right_ok) and back_unblocked
+
+        # Corridor straight rule (judge walls on both sides)
+        if left_wall and right_wall and front_free and front_unblocked and not_back((fx, fy)):
             return (fx, fy), "corridor"
 
-        # Left-hand rule strict
-        if left_free:
-            self.heading = dL
-            return (lx, ly), "turn_left"
-        if front_free:
-            # keep heading
-            return (fx, fy), "forward"
-        if right_free:
-            self.heading = dR
-            return (rx, ry), "turn_right"
-        if back_free:
-            self.heading = dB
-            return (bx, by), "turn_back"
+        # Adaptive: prefer left; if no left wall but right wall exists, hug right
+        if (not left_wall) and right_wall:
+            if right_ok:
+                self.heading = dR; return (rx, ry), "turn_right_adapt"
+            if front_ok:
+                return (fx, fy), "forward_adapt"
+            if left_ok:
+                self.heading = dL; return (lx, ly), "turn_left_adapt"
+        else:
+            if left_ok:
+                self.heading = dL; return (lx, ly), "turn_left"
+            if front_ok:
+                return (fx, fy), "forward"
+            if right_ok:
+                self.heading = dR; return (rx, ry), "turn_right"
 
-        # No move known safe in local window — stay (should be rare with validLineLocal)
+        # Allow back only in true dead ends
+        if dead_end:
+            self.heading = dB
+            return (bx, by), "dead_end_back"
+
+        # Forced (blocked) but avoid back if possible
+        left_forced  = left_free  and not_back((lx, ly))
+        front_forced = front_free and not_back((fx, fy))
+        right_forced = right_free and not_back((rx, ry))
+
+        if left_forced:
+            self.heading = dL; return (lx, ly), "forced_left"
+        if front_forced:
+            return (fx, fy), "forced_forward"
+        if right_forced:
+            self.heading = dR; return (rx, ry), "forced_right"
+
+        if back_free:
+            self.heading = dB; return (bx, by), "forced_back"
+
         return (ax, ay), "stuck"
 
+    def next_target(self, state: State, world: WorldModel) -> Tuple[Tuple[int,int], str]:
+        self._ensure_heading(state)
+        ax, ay = int(state.agent.x), int(state.agent.y)
+
+        # 1) Corridor subgoal (primary)
+        path = world.bfs_to_nearest_corridor((ax, ay), forbid_first=world.last_pos)
+        if path and len(path) >= 2:
+            self.last_mode = "subgoal_corridor"
+            return path[1], "subgoal_corridor"
+
+        # 2) Wall-hug subgoal (secondary): seek any judge-wall-adjacent cell
+        path2 = world.bfs_to_nearest_wallhug((ax, ay), forbid_first=world.last_pos)
+        if path2 and len(path2) >= 2:
+            self.last_mode = "subgoal_wallhug"
+            return path2[1], "subgoal_wallhug"
+
+        # 3) Local wall-follow with anti-backstep & soft-block preference
+        tgt, mode = self._choose_by_hand(state)
+        self.last_mode = mode
+        return tgt, mode
+
 # ────────────────────────────────────────────────────────────────────────────────
-# Low-level driver: choose acceleration toward a grid target
+# Low-level driver (players ignored) with hard speed cap and corridor no-accel
 # ────────────────────────────────────────────────────────────────────────────────
 
 def choose_accel_toward_cell(state: State,
                              world: WorldModel,
-                             policy: LeftWallPolicy,
+                             policy: WallPolicy,
                              target_cell: Tuple[int,int],
                              mode: str) -> Tuple[int,int]:
     assert state.agent is not None and state.visible_track is not None
-    rSafe = max(0, state.circuit.visibility_radius - 1)
+    R = state.circuit.visibility_radius
+    rSafe = max(0, R - 1)
 
     p = state.agent.pos
     v = state.agent.vel
     vx, vy = int(v[0]), int(v[1])
+    cur_speed = float(math.hypot(vx, vy))
 
-    # Target speeds: push harder in corridors to stay centered by momentum
-    max_safe = max(1.0, math.sqrt(2 * max(0, rSafe)))
-    if mode == "corridor":
-        target_speed = max_safe
-    elif mode == "turn_back":
-        target_speed = max(1.0, 0.5 * max_safe)
+    # ---- HARD SPEED CAP: never exceed half the render distance
+    half_R = max(1.0, 0.5 * float(R))
+
+    # target speed per mode, but never above half_R
+    if mode in ("corridor", "subgoal_corridor"):
+        # do NOT accelerate in corridors: keep or reduce, but cap at half_R
+        target_speed = min(cur_speed, half_R)
+    elif "back" in mode:
+        target_speed = min(half_R, max(1.0, 0.5 * half_R))
     else:
-        target_speed = max(1.5, 0.7 * max_safe)
+        # normal/forced turns: free to adjust, but still capped by half_R
+        target_speed = min(half_R, max(1.5, 0.7 * half_R))
 
     to_cell = np.array([target_cell[0], target_cell[1]], dtype=float) - p.astype(float)
     n_to = float(np.linalg.norm(to_cell)) or 1.0
     desired_dir = to_cell / n_to
 
     best = None  # (score, (ax,ay))
-
     for ax in (-1, 0, 1):
         for ay in (-1, 0, 1):
             nvx, nvy = vx + ax, vy + ay
+
+            # braking safety
             if not brakingOk(nvx, nvy, rSafe):
                 continue
+
             next_pos = p + v + np.array([ax, ay], dtype=int)
             nx, ny = int(next_pos[0]), int(next_pos[1])
 
             if not validLineLocal(state, p, next_pos):
                 continue
-            if any(np.all(next_pos == q.pos) for q in state.players):
+
+            next_speed = float(math.hypot(nvx, nvy))
+
+            # HARD CAP: reject candidates exceeding R/2
+            if next_speed > half_R + 1e-9:
+                continue
+
+            # In corridors, reject any acceleration (next_speed > cur_speed)
+            if mode in ("corridor", "subgoal_corridor") and next_speed > cur_speed + 1e-9:
                 continue
 
             dist_cell = float(np.linalg.norm(next_pos.astype(float) - np.array(target_cell, dtype=float)))
-            speed_next = float(math.hypot(nvx, nvy))
-            speed_pen = abs(speed_next - target_speed)
+            speed_pen = abs(next_speed - target_speed)
 
             heading_pen = 0.0
-            if speed_next > 0.0:
-                vel_dir = np.array([nvx, nvy], dtype=float) / max(speed_next, 1e-9)
+            if next_speed > 0.0:
+                vel_dir = np.array([nvx, nvy], dtype=float) / max(next_speed, 1e-9)
                 heading_pen = (1.0 - float(np.dot(vel_dir, desired_dir))) * 0.8
 
             visit_pen = 0.0
@@ -322,35 +497,37 @@ def choose_accel_toward_cell(state: State,
                 visit_pen = 0.15 * float(world.visited_count[nx, ny])
 
             score = (2.0 * dist_cell) + (0.9 * speed_pen) + heading_pen + visit_pen
-            cand = (score, (ax, ay))
-            if (best is None) or (cand[0] < best[0]):
-                best = cand
+            if (best is None) or (score < best[0]):
+                best = (score, (ax, ay))
 
     if best is not None:
         return best[1]
 
-    # Fallbacks that preserve motion preference:
-    # Try to keep moving in current heading if safe.
+    # Fallbacks preserving motion: enforce caps here too
     hx, hy = policy.heading
-    for ax, ay in ((np.sign(hx), np.sign(hy)), (0, 0)):
+    for ax, ay in ((int(np.sign(hx)), int(np.sign(hy))), (0, 0)):
         nvx, nvy = vx + ax, vy + ay
+        next_speed = float(math.hypot(nvx, nvy))
         nxt = p + v + np.array([ax, ay], dtype=int)
-        if brakingOk(nvx, nvy, rSafe) and validLineLocal(state, p, nxt):
-            if not any(np.all(nxt == q.pos) for q in state.players):
-                return int(ax), int(ay)
+        if (brakingOk(nvx, nvy, rSafe)
+            and validLineLocal(state, p, nxt)
+            and next_speed <= half_R + 1e-9
+            and not (mode in ("corridor", "subgoal_corridor") and next_speed > cur_speed + 1e-9)):
+            return int(ax), int(ay)
 
-    return (0, 0)  # last resort
+    return (0, 0)
 
 # ────────────────────────────────────────────────────────────────────────────────
-# ASCII dump (writes to file map_dump.txt every turn)
+# ASCII dump
 # ────────────────────────────────────────────────────────────────────────────────
 
-def dump_ascii(world: WorldModel, policy: LeftWallPolicy, state: State, mode: str) -> None:
+def dump_ascii(world: WorldModel, policy: WallPolicy, state: State, mode: str) -> None:
     if state.agent is None:
         return
     H, W = world.shape
     km = world.known_map
     vis = world.visited_count
+    blk = world.block_ttl > 0
 
     grid = [['?' for _ in range(W)] for _ in range(H)]
     for x in range(H):
@@ -372,6 +549,12 @@ def dump_ascii(world: WorldModel, policy: LeftWallPolicy, state: State, mode: st
             if vis[x, y] > 0 and grid[x][y] not in ('#', 'G', 'S'):
                 grid[x][y] = 'v'
 
+    bx, by = np.where(blk)
+    for i in range(len(bx)):
+        x, y = int(bx[i]), int(by[i])
+        if grid[x][y] not in ('#', 'G', 'S'):
+            grid[x][y] = 'X'
+
     for p in state.players:
         if 0 <= p.x < H and 0 <= p.y < W:
             grid[p.x][p.y] = 'O'
@@ -383,9 +566,9 @@ def dump_ascii(world: WorldModel, policy: LeftWallPolicy, state: State, mode: st
     hdr = []
     hdr.append(
         f"TURN {world.turn}  pos=({ax},{ay}) vel=({int(state.agent.vel_x)},{int(state.agent.vel_y)}) "
-        f"mode={mode} heading={policy.heading}"
+        f"mode={mode} heading={policy.heading} last_pos={world.last_pos}"
     )
-    hdr.append("LEGEND: #=WALL  ?=UNKNOWN  .=EMPTY  G=GOAL  S=START  v=visited  O=other  A=agent")
+    hdr.append("LEGEND: #=WALL  ?=UNKNOWN  .=EMPTY  G=GOAL  S=START  v=visited  X=soft-block  O=other  A=agent  (speed cap=R/2)")
     lines = ["\n".join(hdr)]
     for x in range(H):
         lines.append("".join(grid[x]))
@@ -402,17 +585,24 @@ def dump_ascii(world: WorldModel, policy: LeftWallPolicy, state: State, mode: st
 # Decision loop
 # ────────────────────────────────────────────────────────────────────────────────
 
-def calculateMove(world: WorldModel, policy: LeftWallPolicy, state: State) -> Tuple[int,int]:
+def calculateMove(world: WorldModel, policy: WallPolicy, state: State) -> Tuple[int,int]:
     assert state.agent is not None and state.visible_raw is not None
+
+    world.decay_blocks()
     world.updateWithObservation(state)
 
-    ax, ay = int(state.agent.x), int(state.agent.y)
+    curr = (int(state.agent.x), int(state.agent.y))
+    if world.last_pos is not None and world.last_pos != curr:
+        px, py = world.last_pos
+        world.block_ttl[px, py] = world.BLOCK_TTL_DEFAULT
+
+    ax, ay = curr
     world.visited_count[ax, ay] += 1
 
-    target_cell, mode = policy.next_grid_target(state)
+    target_cell, mode = policy.next_target(state, world)
     ax_cmd, ay_cmd = choose_accel_toward_cell(state, world, policy, target_cell, mode)
 
-    world.last_pos = (ax, ay)
+    world.last_pos = curr
     dump_ascii(world, policy, state, mode)
     world.turn += 1
 
@@ -428,7 +618,7 @@ def main():
     state: Optional[State] = State(circuit, None, None, [], None)
 
     world = WorldModel(circuit.track_shape)
-    policy = LeftWallPolicy(world)
+    policy = WallPolicy(world)
 
     while True:
         assert state is not None
@@ -438,7 +628,6 @@ def main():
 
         ax, ay = calculateMove(world, policy, state)
 
-        # clamp to judge-legal range
         ax = -1 if ax < -1 else (1 if ax > 1 else int(ax))
         ay = -1 if ay < -1 else (1 if ay > 1 else int(ay))
         print(f"{ax} {ay}", flush=True)
