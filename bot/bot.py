@@ -71,9 +71,10 @@ def read_observation(old_state: State) -> Optional[State]:
             y_start = posy - R
             y_end   = posy + R + 1
             loc = row_vals
-            ys = 0 if y_start < 0 else y_start
+            ys = y_start
             if y_start < 0:
                 loc = loc[-y_start:]
+                ys = 0
             if y_end > W:
                 loc = loc[:-(y_end - W)]
             ye = ys + len(loc)
@@ -122,69 +123,11 @@ class WorldModel:
         self._STALL_RESET = 8
         self.no_backtrack_lock: int = 0
 
-        # >>> crash-aware confirmation / freeze handling
-        self.pending_edge: Optional[Tuple[int,int,int,int]] = None  # (x,y,nx,ny)
-        self.predicted_next: Optional[Tuple[int,int]] = None        # (nx,ny) we intended
-        self.last_from: Optional[Tuple[int,int]] = None             # where we started last tick
-        self.freeze_ticks_left: int = 0                             # after crash, judge holds us ~5 ticks
-
     def updateWithObservation(self, st: State) -> None:
         if st.visible_raw is None: return
         raw = st.visible_raw
         seen = (raw != CellType.NOT_VISIBLE.value)
         self.known_map[seen] = raw[seen]
-
-    # >>> confirm previous move, or register a collision if it failed
-    def confirm_or_reject_last_move(self, st: State) -> None:
-        if st.agent is None:
-            # nothing to confirm
-            self.pending_edge = None
-            self.predicted_next = None
-            self.last_from = None
-            return
-
-        cur = (int(st.agent.x), int(st.agent.y))
-        cur_vel = (int(st.agent.vel_x), int(st.agent.vel_y))
-
-        if self.predicted_next is None:
-            # No tentative move recorded last tick.
-            return
-
-        if cur == self.predicted_next:
-            # success: only now do we touch the edge (confirm traversal)
-            if self.pending_edge is not None:
-                x, y, nx, ny = self.pending_edge
-                self.edge_visits[(x, y, nx, ny)] += 1
-            # clear tentative state
-            self.pending_edge = None
-            self.predicted_next = None
-            self.last_from = None
-            return
-
-        # If we got here, our predicted next wasn't reached -> likely collision.
-        # Heuristics: judge usually freezes us ~5 ticks with vel=(0,0)
-        if cur_vel == (0, 0):
-            self.freeze_ticks_left = max(self.freeze_ticks_left, 5)
-
-        # Strongly discourage repeating this exact edge
-        if self.pending_edge is not None:
-            x, y, nx, ny = self.pending_edge
-            self.edge_visits[(x, y, nx, ny)] += 5  # heavier penalty for failed attempt
-
-        # Conservative map update: mark the predicted landing cell as WALL (we hit something along that path)
-        px, py = self.predicted_next
-        if 0 <= px < self.shape[0] and 0 <= py < self.shape[1]:
-            self.known_map[px, py] = CellType.WALL.value
-
-        # Drop current subgoal so the policy replans locally
-        self.commit_target = None
-        self.commit_ttl = 0
-        self.stalled_steps = 0
-
-        # Clear tentative state
-        self.pending_edge = None
-        self.predicted_next = None
-        self.last_from = None
 
     # neighborhood
     def _n4(self, x: int, y: int):
@@ -251,6 +194,7 @@ class WorldModel:
 
     # ---- DFS-style: does a neighbor lead to a reachable frontier? (and where) ----
     def _info_gain(self, c: Tuple[int,int]) -> int:
+        # count unknowns in a 3x3 around c (cheap proxy for visibility gain)
         x, y = c
         H, W = self.shape
         tot = 0
@@ -261,6 +205,7 @@ class WorldModel:
         return tot
 
     def leads_to_frontier(self, start_xy: Tuple[int,int], max_expansions: int = 3000) -> Optional[Tuple[Tuple[int,int], int]]:
+        # BFS over known traversable cells; return first frontier cell with its info gain
         sx, sy = start_xy
         if not self.trav(sx, sy):
             return None
@@ -509,6 +454,7 @@ def _choose_committed_target(world: WorldModel, agentXY: Tuple[int,int]) -> Opti
 
     x, y = agentXY
     if not world.trav(x,y):
+        # If agent XY not marked traversable yet, fall back to nearest frontier search
         path = world.nearestFrontierFrom(agentXY)
         if path:
             world.commit_target = path[-1]
@@ -527,9 +473,11 @@ def _choose_committed_target(world: WorldModel, agentXY: Tuple[int,int]) -> Opti
     tried = world.tried_exits[(x,y)]
     untried = [e for e in exits if e[0] not in tried]
 
+    # If we have untried exits at the current cell, push this cell as a branch and take the best exit
     if untried:
         if not world.branch_stack or world.branch_stack[-1] != (x,y):
             world.branch_stack.append((x,y))
+        # score: prefer higher info gain, then shorter distance to the frontier cell, then smaller turn from last_dir
         vdir = world.last_dir.astype(float)
         def score(e):
             dvec, _, fcell, gain = e
@@ -541,6 +489,7 @@ def _choose_committed_target(world: WorldModel, agentXY: Tuple[int,int]) -> Opti
                 n_to = np.linalg.norm(to) or 1.0
                 cos = float(np.dot(vdir, to) / (np.linalg.norm(vdir) * n_to))
                 turn = (1.0 - cos) * 2.0
+            # higher gain is better => negative in score
             return (dist + turn) - 3.0*gain
         untried.sort(key=score)
         best = untried[0]
@@ -550,8 +499,10 @@ def _choose_committed_target(world: WorldModel, agentXY: Tuple[int,int]) -> Opti
         world.commit_ttl = world._COMMIT_TTL_DEFAULT
         return world.commit_target
 
+    # No untried exits here: backtrack to the last junction that still has an untried exit
     while world.branch_stack:
         bx, by = world.branch_stack[-1]
+        # recompute exits for that branch (map knowledge may have changed)
         b_exits = []
         for nx, ny, d in world.traversable_neighbors(bx, by):
             reach = world.leads_to_frontier((nx,ny))
@@ -561,11 +512,14 @@ def _choose_committed_target(world: WorldModel, agentXY: Tuple[int,int]) -> Opti
         b_tried = world.tried_exits[(bx,by)]
         b_untried = [e for e in b_exits if e[0] not in b_tried]
         if b_untried:
+            # set target to the branch cell first (precise backtrack stop)
             world.commit_target = (bx, by)
             world.commit_ttl = world._COMMIT_TTL_DEFAULT
             return world.commit_target
+        # otherwise fully explored; pop it and continue searching up the stack
         world.branch_stack.pop()
 
+    # If stack empty, do a nearest-frontier fallback
     fpath = world.nearestFrontierFrom(agentXY)
     if fpath:
         world.commit_target = fpath[-1]
@@ -696,17 +650,21 @@ def pure_pursuit_move(state: State, world: WorldModel,
     assert state.agent is not None
     agent_xy = (int(state.agent.x), int(state.agent.y))
 
+    # Choose / keep a committed target using DFS-junction policy
     target = _choose_committed_target(world, agent_xy)
     if target is None:
         return None
 
+    # If target is a branch cell and we're away from it, this causes controlled backtrack (not to spawn, just to last junction)
     path = coarse.plan_path(agent_xy, target)
     if not path or len(path) <= 1:
         return None
 
+    # If we arrived to a branch cell during backtrack, immediately pick a fresh untried exit next tick
     if agent_xy == target and world.branch_stack and world.branch_stack[-1] == target:
         world.no_backtrack_lock = 6  # keep resisting accidental step-back
 
+    # choose furthest visible waypoint and adapt speed
     far_idx, wp = _furthest_visible_on_path(world, agent_xy, path, max_jump=40)
     curv = _path_curvature(path, max(1, min(far_idx, len(path)-2)))
     dist_left = float(len(path) - far_idx)
@@ -721,6 +679,7 @@ def pure_pursuit_move(state: State, world: WorldModel,
             scored.append((sc, nxny, (ax, ay)))
     if not scored: return None
 
+    # Strong preference to avoid stepping exactly back onto prev_pos, unless forced
     prev_cell = tuple(world.prev_pos) if world.prev_pos is not None else None
     non_back = []
     for sc, nxny, axay in scored:
@@ -741,23 +700,7 @@ def pure_pursuit_move(state: State, world: WorldModel,
 
 def calculateMove(world: WorldModel, planner: AStarPlanner, state: State, coarse: CoarsePlanner2D) -> Tuple[int,int]:
     assert state.agent is not None and state.visible_raw is not None
-
-    # >>> Confirm success/failure of the *previous* tick's tentative move
-    world.confirm_or_reject_last_move(state)
-
     world.updateWithObservation(state)
-
-    # If we are frozen after a crash, just send 0 0 for a few ticks.
-    if world.freeze_ticks_left > 0:
-        world.freeze_ticks_left -= 1
-        agentXY = (int(state.agent.x), int(state.agent.y))
-        if world.prev_pos is not None:
-            world.last_dir = np.array(agentXY) - np.array(world.prev_pos)
-        world.backtrail.append(agentXY)
-        world.visited_count[agentXY[0], agentXY[1]] += 1
-        world.prev_pos = agentXY
-        # do NOT set any pending edge while frozen
-        return (0, 0)
 
     R = state.circuit.visibility_radius
     rSafe = max(0, R - 1)
@@ -779,32 +722,16 @@ def calculateMove(world: WorldModel, planner: AStarPlanner, state: State, coarse
             move = fallbackMoveWithBrakeAndBias(state, world, rSafe)
 
     ax, ay = move
-    # Predict the next absolute position (tentative)
     nextPos = state.agent.pos + state.agent.vel + np.array([ax, ay])
-
-    # Avoid stepping into another player's cell
     if any(np.all(nextPos == p.pos) for p in state.players):
         ax, ay = 0, 0
         nextPos = state.agent.pos + state.agent.vel
 
     world.visited_count[agentXY[0], agentXY[1]] += 1
-
     nx, ny = int(nextPos[0]), int(nextPos[1])
+    world.touch_edge(agentXY[0], agentXY[1], nx, ny)
 
-    # >>> Do NOT finalize the edge yet; record it tentatively
-    if (0 <= nx < world.shape[0]) and (0 <= ny < world.shape[1]):
-        world.pending_edge = (agentXY[0], agentXY[1], nx, ny)
-        world.predicted_next = (nx, ny)
-        world.last_from = agentXY
-    else:
-        # Out-of-bounds attempt; treat as immediate failure: discourage direction and send 0 0
-        world.edge_visits[(agentXY[0], agentXY[1], nx, ny)] += 5
-        ax, ay = 0, 0
-        world.pending_edge = None
-        world.predicted_next = None
-        world.last_from = None
-
-    # stalled protection: if subgoal isn't getting closer (based on tentative next), drop it
+    # stalled protection: if subgoal isn't getting closer, drop it
     if world.commit_target is not None:
         before = abs(agentXY[0]-world.commit_target[0]) + abs(agentXY[1]-world.commit_target[1])
         after  = abs(nx-world.commit_target[0]) + abs(ny-world.commit_target[1])
@@ -840,7 +767,6 @@ def main():
         ax, ay = calculateMove(world, planner, state, coarse)
         ax = -1 if ax < -1 else (1 if ax > 1 else int(ax))
         ay = -1 if ay < -1 else (1 if ay > 1 else int(ay))
-        
         print(f"{ax} {ay}", flush=True)
 
 if __name__ == "__main__":
